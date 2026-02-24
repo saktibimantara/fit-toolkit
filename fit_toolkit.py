@@ -446,6 +446,124 @@ def process_fit_bytes(file_bytes, new_start_dt):
 
 
 # ==============================================================================
+# Route Similarity (Fréchet distance + overlap)
+# ==============================================================================
+
+import math
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    """Haversine distance in metres between two (lat, lon) points."""
+    R = 6_371_000  # Earth radius in metres
+    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _discrete_frechet(P, Q, dist_fn, max_pts=500):
+    """Compute the discrete Fréchet distance between two polylines.
+    P, Q: lists of (lat, lon) tuples.
+    Returns distance in the same unit as dist_fn (metres)."""
+    # Downsample for performance — O(n*m) memory + time
+    if len(P) > max_pts:
+        step = len(P) / max_pts
+        P = [P[int(i * step)] for i in range(max_pts)]
+    if len(Q) > max_pts:
+        step = len(Q) / max_pts
+        Q = [Q[int(i * step)] for i in range(max_pts)]
+    n, m = len(P), len(Q)
+    if n == 0 or m == 0:
+        return float('inf')
+    # DP table (flat list for speed)
+    ca = [-1.0] * (n * m)
+    def _c(i, j):
+        idx = i * m + j
+        if ca[idx] >= 0:
+            return ca[idx]
+        d = dist_fn(P[i][0], P[i][1], Q[j][0], Q[j][1])
+        if i == 0 and j == 0:
+            ca[idx] = d
+        elif i == 0:
+            ca[idx] = max(_c(0, j - 1), d)
+        elif j == 0:
+            ca[idx] = max(_c(i - 1, 0), d)
+        else:
+            ca[idx] = max(min(_c(i - 1, j), _c(i - 1, j - 1), _c(i, j - 1)), d)
+        return ca[idx]
+    # Avoid Python recursion limit — use iterative bottom-up instead
+    for i in range(n):
+        for j in range(m):
+            d = dist_fn(P[i][0], P[i][1], Q[j][0], Q[j][1])
+            idx = i * m + j
+            if i == 0 and j == 0:
+                ca[idx] = d
+            elif i == 0:
+                ca[idx] = max(ca[j - 1], d)
+            elif j == 0:
+                ca[idx] = max(ca[(i - 1) * m], d)
+            else:
+                ca[idx] = max(min(ca[(i - 1) * m + j], ca[(i - 1) * m + (j - 1)], ca[i * m + (j - 1)]), d)
+    return ca[n * m - 1]
+
+
+def _overlap_pct(P, Q, threshold_m=50.0, max_pts=1000):
+    """Compute what percentage of points in P are within threshold_m of any point in Q.
+    Returns (pct_P_near_Q, pct_Q_near_P) as 0-100 floats."""
+    if not P or not Q:
+        return 0.0, 0.0
+    # Downsample for performance
+    if len(P) > max_pts:
+        step = len(P) / max_pts
+        P = [P[int(i * step)] for i in range(max_pts)]
+    if len(Q) > max_pts:
+        step = len(Q) / max_pts
+        Q = [Q[int(i * step)] for i in range(max_pts)]
+
+    def _near_count(source, target):
+        count = 0
+        for sp in source:
+            for tp in target:
+                if _haversine_m(sp[0], sp[1], tp[0], tp[1]) <= threshold_m:
+                    count += 1
+                    break
+        return count
+
+    near_pq = _near_count(P, Q)
+    near_qp = _near_count(Q, P)
+    return round(near_pq / len(P) * 100, 1), round(near_qp / len(Q) * 100, 1)
+
+
+def compute_route_similarity(gps_a, gps_b):
+    """Compute similarity between two GPS point lists.
+    Each list contains (lat, lon, rec_idx) tuples.
+    Returns dict with frechet_m, frechet_score (0-100), overlap_a, overlap_b, overlap_avg."""
+    # Strip rec_idx for distance calculations
+    P = [(p[0], p[1]) for p in gps_a]
+    Q = [(p[0], p[1]) for p in gps_b]
+    if len(P) < 2 or len(Q) < 2:
+        return None
+
+    frechet_m = _discrete_frechet(P, Q, _haversine_m)
+    # Convert Fréchet distance to a 0-100 score:
+    # 0m → 100%, 50m → ~95%, 200m → ~80%, 1000m → ~37%, 5000m → ~1%
+    # Using exponential decay: score = 100 * exp(-d / 300)
+    frechet_score = round(100 * math.exp(-frechet_m / 300), 1)
+    frechet_score = max(0.0, min(100.0, frechet_score))
+
+    overlap_a, overlap_b = _overlap_pct(P, Q, threshold_m=50.0)
+    overlap_avg = round((overlap_a + overlap_b) / 2, 1)
+
+    return {
+        'frechet_m': round(frechet_m, 1),
+        'frechet_score': frechet_score,
+        'overlap_a': overlap_a,
+        'overlap_b': overlap_b,
+        'overlap_avg': overlap_avg,
+    }
+
+
+# ==============================================================================
 # Web Server (stdlib only — no Flask, no pip install)
 # ==============================================================================
 
@@ -711,6 +829,25 @@ class FITHandler(BaseHTTPRequestHandler):
                         pts = [pts[int(i * step)] for i in range(2000)] + [pts[-1]]
                     result[fid] = {'points': [[p[0], p[1]] for p in pts]}
             self._send_json(result)
+
+        elif path == '/similarity':
+            qs = urllib.parse.parse_qs(parsed.query)
+            id_a = qs.get('a', [None])[0]
+            id_b = qs.get('b', [None])[0]
+            if not id_a or not id_b:
+                self._send_json({'error': 'Need ?a=fileId&b=fileId'}, 400)
+            elif id_a not in uploaded_files or id_b not in uploaded_files:
+                self._send_json({'error': 'File not found'}, 404)
+            else:
+                gps_a = uploaded_files[id_a].get('gps_points', [])
+                gps_b = uploaded_files[id_b].get('gps_points', [])
+                result = compute_route_similarity(gps_a, gps_b)
+                if result is None:
+                    self._send_json({'error': 'Insufficient GPS data'}, 400)
+                else:
+                    result['file_a'] = uploaded_files[id_a]['filename']
+                    result['file_b'] = uploaded_files[id_b]['filename']
+                    self._send_json(result)
 
         elif path == '/download-zip':
             qs = urllib.parse.parse_qs(parsed.query)
@@ -1041,6 +1178,16 @@ HTML_PAGE = """<!DOCTYPE html>
   .overlay-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; font-size: 0.78rem; }
   .overlay-legend-item { display: flex; align-items: center; gap: 4px; }
   .overlay-swatch { width: 14px; height: 3px; border-radius: 2px; }
+  /* Similarity scores */
+  .similarity-card { display: none; }
+  .similarity-card.active { display: block; }
+  .sim-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .sim-item { background: var(--bg); border-radius: 8px; padding: 14px; text-align: center; }
+  .sim-score { font-size: 1.8rem; font-weight: 800; line-height: 1; }
+  .sim-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin-bottom: 6px; }
+  .sim-detail { font-size: 0.78rem; color: var(--text-muted); margin-top: 4px; }
+  .sim-bar-bg { height: 6px; background: var(--border); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+  .sim-bar-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease; }
   /* Map cursor marker */
   .map-cursor-marker {
     width: 14px; height: 14px; border-radius: 50%;
@@ -1086,6 +1233,11 @@ HTML_PAGE = """<!DOCTYPE html>
       <span><span class="legend-dot" style="background:#22c55e"></span>Start</span>
       <span><span class="legend-dot" style="background:#ef4444"></span>Finish</span>
     </div>
+  </div>
+
+  <div class="card similarity-card" id="similarity-card">
+    <div class="card-title">Route Similarity</div>
+    <div class="sim-grid" id="simGrid"></div>
   </div>
 
   <div class="card" id="charts-card">
@@ -1308,7 +1460,7 @@ function removeFile(id) {
     if (first.gps_count > 0) loadRoute(keys[0]); else hideMap();
     if (first.has_stats) loadStats(keys[0]); else hideStats();
     if (first.has_laps) loadLaps(keys[0]); else hideLaps();
-  } else { hideMap(); hideStats(); hideLaps(); hideZones(); }
+  } else { hideMap(); hideStats(); hideLaps(); hideZones(); hideSimilarity(); }
   if (overlayFileIds.length > 1) refreshOverlay();
 }
 
@@ -1739,6 +1891,7 @@ function toggleOverlay(fileId, checked) {
   else {
     // Revert to single-file view
     document.getElementById('overlayLegend').style.display = 'none';
+    hideSimilarity();
     overlayTimeseries = {};
     const keys = Object.keys(files);
     if (keys.length > 0) {
@@ -1811,6 +1964,73 @@ async function refreshOverlay() {
   if (!anyGps) hideMap();
 
   if (first) renderOverlayChart(first);
+
+  // Compute pairwise similarity for overlay files with GPS
+  loadSimilarity();
+}
+
+async function loadSimilarity() {
+  const gpsIds = overlayFileIds.filter(fid => files[fid] && files[fid].gps_count > 0);
+  if (gpsIds.length < 2) { hideSimilarity(); return; }
+
+  // For now, compare all pairs (practical for 2-4 files)
+  const pairs = [];
+  for (let i = 0; i < gpsIds.length; i++) {
+    for (let j = i + 1; j < gpsIds.length; j++) {
+      pairs.push([gpsIds[i], gpsIds[j]]);
+    }
+  }
+
+  const results = [];
+  for (const [a, b] of pairs) {
+    try {
+      const r = await fetch('/similarity?a=' + a + '&b=' + b);
+      const d = await r.json();
+      if (!d.error) results.push(d);
+    } catch (e) { console.warn('Similarity error:', e); }
+  }
+
+  if (results.length > 0) {
+    document.getElementById('similarity-card').classList.add('active');
+    renderSimilarity(results);
+  } else {
+    hideSimilarity();
+  }
+}
+
+function scoreColor(pct) {
+  if (pct >= 80) return '#16a34a';
+  if (pct >= 50) return '#f59e0b';
+  return '#dc2626';
+}
+
+function renderSimilarity(results) {
+  const grid = document.getElementById('simGrid');
+  let html = '';
+  for (const r of results) {
+    const nameA = r.file_a.replace(/\\.fit$/i, '');
+    const nameB = r.file_b.replace(/\\.fit$/i, '');
+    const fColor = scoreColor(r.frechet_score);
+    const oColor = scoreColor(r.overlap_avg);
+    html += '<div class="sim-item">' +
+      '<div class="sim-label">Shape Similarity</div>' +
+      '<div class="sim-score" style="color:' + fColor + '">' + r.frechet_score + '%</div>' +
+      '<div class="sim-bar-bg"><div class="sim-bar-fill" style="width:' + r.frechet_score + '%;background:' + fColor + '"></div></div>' +
+      '<div class="sim-detail">Fr\\u00e9chet: ' + (r.frechet_m < 1000 ? Math.round(r.frechet_m) + ' m' : (r.frechet_m/1000).toFixed(1) + ' km') + '</div>' +
+      '</div>';
+    html += '<div class="sim-item">' +
+      '<div class="sim-label">Route Overlap</div>' +
+      '<div class="sim-score" style="color:' + oColor + '">' + r.overlap_avg + '%</div>' +
+      '<div class="sim-bar-bg"><div class="sim-bar-fill" style="width:' + r.overlap_avg + '%;background:' + oColor + '"></div></div>' +
+      '<div class="sim-detail">' + nameA + ': ' + r.overlap_a + '% \\u00b7 ' + nameB + ': ' + r.overlap_b + '%</div>' +
+      '</div>';
+  }
+  grid.innerHTML = html;
+}
+
+function hideSimilarity() {
+  document.getElementById('similarity-card').classList.remove('active');
+  document.getElementById('simGrid').innerHTML = '';
 }
 
 async function loadStats(fileId) {
