@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 FIT Toolkit
-A web-based toolkit for working with Garmin FIT files.
-Features: timestamp adjustment, route map visualization, batch processing.
+A web-based application to adjust timestamps in Garmin FIT files.
+Supports batch processing and setting a new start date/time.
 
 Zero dependencies — uses only the Python standard library.
 
 Usage:
-    python3 fit_toolkit.py
+    python3 fit_time_adjuster.py
 
 Then open http://localhost:5050 in your browser (opens automatically).
 """
@@ -52,7 +52,73 @@ CRC_TABLE = [
 INVALID_TIMESTAMP = 0xFFFFFFFF
 INVALID_LATLON = 0x7FFFFFFF  # Sentinel for "no GPS fix"
 SEMICIRCLES_TO_DEG = 180.0 / (2**31)
-RECORD_MSG_NUM = 20  # Global message number for GPS record messages
+RECORD_MSG_NUM = 20   # Global message number for record (per-second data)
+SESSION_MSG_NUM = 18   # Global message number for session summary
+LAP_MSG_NUM = 19       # Global message number for lap summary
+
+# Invalid sentinel values by size
+INVALID_UINT8 = 0xFF
+INVALID_UINT16 = 0xFFFF
+INVALID_UINT32 = 0xFFFFFFFF
+INVALID_SINT8 = 0x7F
+
+# Session fields to extract: field_def_num → (name, format, scale_divisor)
+# format: 'B'=uint8, 'H'=uint16, 'I'=uint32, 'b'=sint8
+SESSION_FIELDS = {
+    7:  ('total_elapsed_time', 'I', 1000),   # ms → s
+    8:  ('total_timer_time', 'I', 1000),     # ms → s
+    9:  ('total_distance', 'I', 100),        # cm → m
+    11: ('total_calories', 'H', 1),
+    14: ('avg_speed', 'H', 1000),            # mm/s → m/s
+    15: ('max_speed', 'H', 1000),
+    16: ('avg_heart_rate', 'B', 1),
+    17: ('max_heart_rate', 'B', 1),
+    18: ('avg_cadence', 'B', 1),
+    19: ('max_cadence', 'B', 1),
+    20: ('avg_power', 'H', 1),
+    21: ('max_power', 'H', 1),
+    22: ('total_ascent', 'H', 1),
+    23: ('total_descent', 'H', 1),
+    34: ('normalized_power', 'H', 1),
+    57: ('avg_temperature', 'b', 1),         # sint8
+    124: ('enhanced_avg_speed', 'I', 1000),  # prefer over field 14
+    125: ('enhanced_max_speed', 'I', 1000),  # prefer over field 15
+}
+
+# Lap fields to extract: field_def_num → (name, format, scale_divisor)
+LAP_FIELDS = {
+    253: ('timestamp', 'I', 1),
+    7:   ('total_elapsed_time', 'I', 1000),   # ms → s
+    8:   ('total_timer_time', 'I', 1000),     # ms → s
+    9:   ('total_distance', 'I', 100),        # cm → m
+    11:  ('total_calories', 'H', 1),
+    14:  ('avg_speed', 'H', 1000),            # mm/s → m/s
+    15:  ('max_speed', 'H', 1000),
+    16:  ('avg_heart_rate', 'B', 1),
+    17:  ('max_heart_rate', 'B', 1),
+    18:  ('avg_cadence', 'B', 1),
+    19:  ('max_cadence', 'B', 1),
+    20:  ('avg_power', 'H', 1),
+    21:  ('max_power', 'H', 1),
+    22:  ('total_ascent', 'H', 1),
+    23:  ('total_descent', 'H', 1),
+    34:  ('normalized_power', 'H', 1),
+    124: ('enhanced_avg_speed', 'I', 1000),
+    125: ('enhanced_max_speed', 'I', 1000),
+}
+
+# Record fields to extract: field_def_num → (name, format, scale_divisor, offset_sub)
+RECORD_FIELDS = {
+    253: ('timestamp', 'I', 1, 0),
+    2:   ('altitude', 'H', 5, 500),          # (raw/5) - 500 → m
+    3:   ('heart_rate', 'B', 1, 0),
+    4:   ('cadence', 'B', 1, 0),
+    5:   ('distance', 'I', 100, 0),          # cm → m
+    6:   ('speed', 'H', 1000, 0),            # mm/s → m/s
+    7:   ('power', 'H', 1, 0),
+    13:  ('temperature', 'b', 1, 0),         # sint8
+    78:  ('enhanced_altitude', 'I', 5, 500), # prefer over field 2
+}
 
 
 def crc16_fit(data: bytes) -> int:
@@ -86,6 +152,9 @@ class FITFile:
         self.first_timestamp = None
         self.timestamp_locations = []
         self.gps_points = []  # List of (lat, lon) in decimal degrees
+        self.session_stats = {}  # Summary stats from session message
+        self.records = []  # Time-series data from record messages
+        self.laps = []  # Per-lap summaries from lap messages
         self._parse()
 
     def _parse(self):
@@ -129,6 +198,9 @@ class FITFile:
         self.timestamp_locations = []
         self.first_timestamp = None
         self.gps_points = []
+        self.session_stats = {}
+        self.records = []
+        self.laps = []
 
         while pos < self.data_end and pos < len(self.data):
             rh = self.data[pos]
@@ -141,6 +213,9 @@ class FITFile:
                 defn = self.definitions[lmt]
                 self._collect_timestamps(pos, defn)
                 self._collect_gps(pos, defn)
+                self._collect_session(pos, defn)
+                self._collect_record_data(pos, defn)
+                self._collect_lap_data(pos, defn)
                 pos += defn['total_size']
 
             elif rh & 0x40:
@@ -154,15 +229,26 @@ class FITFile:
 
                 total = 0
                 ts_fields = []
-                gps_fields = {}  # field_def_num -> offset
+                gps_fields = {}
+                session_fields = {}  # fdn → (offset, size, fmt)
+                record_fields = {}   # fdn → (offset, size, fmt)
+                lap_fields = {}      # fdn → (offset, size)
                 for _ in range(nf):
-                    fdn, fsz = self.data[pos], self.data[pos+1]
+                    fdn, fsz, ftype = self.data[pos], self.data[pos+1], self.data[pos+2]
                     pos += 3
                     if fsz == 4 and self._is_timestamp_field(fdn, gmn):
                         ts_fields.append((total, fsz, fdn))
-                    # GPS: field 0 = lat, field 1 = lon (sint32, 4 bytes) in record msg
                     if gmn == RECORD_MSG_NUM and fdn in (0, 1) and fsz == 4:
                         gps_fields[fdn] = total
+                    # Track session fields
+                    if gmn == SESSION_MSG_NUM and fdn in SESSION_FIELDS:
+                        session_fields[fdn] = (total, fsz)
+                    # Track lap fields
+                    if gmn == LAP_MSG_NUM and fdn in LAP_FIELDS:
+                        lap_fields[fdn] = (total, fsz)
+                    # Track record fields
+                    if gmn == RECORD_MSG_NUM and fdn in RECORD_FIELDS:
+                        record_fields[fdn] = (total, fsz)
                     total += fsz
 
                 dev_total = 0
@@ -173,8 +259,12 @@ class FITFile:
 
                 self.definitions[lmt] = {
                     'endian': endian, 'total_size': total + dev_total,
+                    'global_msg_num': gmn,
                     'timestamp_fields': ts_fields,
-                    'gps_fields': gps_fields,  # {0: lat_offset, 1: lon_offset}
+                    'gps_fields': gps_fields,
+                    'session_fields': session_fields,
+                    'record_fields': record_fields,
+                    'lap_fields': lap_fields,
                 }
             else:
                 lmt = rh & 0x0F
@@ -183,6 +273,9 @@ class FITFile:
                 defn = self.definitions[lmt]
                 self._collect_timestamps(pos, defn)
                 self._collect_gps(pos, defn)
+                self._collect_session(pos, defn)
+                self._collect_record_data(pos, defn)
+                self._collect_lap_data(pos, defn)
                 pos += defn['total_size']
 
     def _collect_timestamps(self, data_start, defn):
@@ -217,7 +310,95 @@ class FITFile:
             return
         lat = lat_raw * SEMICIRCLES_TO_DEG
         lon = lon_raw * SEMICIRCLES_TO_DEG
-        self.gps_points.append((round(lat, 6), round(lon, 6)))
+        # Store record index for map-chart linking
+        rec_idx = len(self.records)  # current record count (GPS collected before record in same msg)
+        self.gps_points.append((round(lat, 6), round(lon, 6), rec_idx))
+
+    def _read_field(self, data_start, offset, size, fmt, endian):
+        """Read a single field value, applying the correct struct format."""
+        aoff = data_start + offset
+        if aoff + size > len(self.data):
+            return None
+        fmt_map = {'B': 'B', 'H': 'H', 'I': 'I', 'b': 'b'}
+        sf = fmt_map.get(fmt)
+        if sf is None:
+            return None
+        # Ensure size matches expected
+        expected = struct.calcsize(sf)
+        if size < expected:
+            return None
+        val = struct.unpack_from(f'{endian}{sf}', self.data, aoff)[0]
+        # Check invalid sentinels
+        if fmt == 'B' and val == INVALID_UINT8:
+            return None
+        if fmt == 'H' and val == INVALID_UINT16:
+            return None
+        if fmt == 'I' and val == INVALID_UINT32:
+            return None
+        if fmt == 'b' and val == INVALID_SINT8:
+            return None
+        return val
+
+    def _collect_session(self, data_start, defn):
+        """Extract summary stats from session message (global msg 18)."""
+        session_fields = defn.get('session_fields', {})
+        if not session_fields:
+            return
+        endian = defn['endian']
+        for fdn, (offset, size) in session_fields.items():
+            meta = SESSION_FIELDS[fdn]
+            name, fmt, scale = meta
+            val = self._read_field(data_start, offset, size, fmt, endian)
+            if val is not None:
+                scaled = val / scale if scale > 1 else val
+                self.session_stats[name] = round(scaled, 3) if isinstance(scaled, float) else scaled
+        # Prefer enhanced fields
+        if 'enhanced_avg_speed' in self.session_stats:
+            self.session_stats['avg_speed'] = self.session_stats.pop('enhanced_avg_speed')
+        if 'enhanced_max_speed' in self.session_stats:
+            self.session_stats['max_speed'] = self.session_stats.pop('enhanced_max_speed')
+
+    def _collect_record_data(self, data_start, defn):
+        """Extract time-series data from record messages (global msg 20)."""
+        record_fields = defn.get('record_fields', {})
+        if not record_fields:
+            return
+        endian = defn['endian']
+        rec = {}
+        for fdn, (offset, size) in record_fields.items():
+            name, fmt, scale, off_sub = RECORD_FIELDS[fdn]
+            val = self._read_field(data_start, offset, size, fmt, endian)
+            if val is not None:
+                scaled = val / scale if scale > 1 else val
+                if off_sub:
+                    scaled = scaled - off_sub
+                rec[name] = round(scaled, 2) if isinstance(scaled, float) else scaled
+        # Prefer enhanced fields
+        if 'enhanced_altitude' in rec:
+            rec['altitude'] = rec.pop('enhanced_altitude')
+        if rec:
+            self.records.append(rec)
+
+    def _collect_lap_data(self, data_start, defn):
+        """Extract lap summaries from lap messages (global msg 19)."""
+        lap_fields = defn.get('lap_fields', {})
+        if not lap_fields:
+            return
+        endian = defn['endian']
+        lap = {}
+        for fdn, (offset, size) in lap_fields.items():
+            name, fmt, scale = LAP_FIELDS[fdn]
+            val = self._read_field(data_start, offset, size, fmt, endian)
+            if val is not None:
+                scaled = val / scale if scale > 1 else val
+                lap[name] = round(scaled, 3) if isinstance(scaled, float) else scaled
+        # Prefer enhanced fields
+        if 'enhanced_avg_speed' in lap:
+            lap['avg_speed'] = lap.pop('enhanced_avg_speed')
+        if 'enhanced_max_speed' in lap:
+            lap['max_speed'] = lap.pop('enhanced_max_speed')
+        if lap:
+            self.laps.append(lap)
 
     def get_start_datetime(self):
         if self.first_timestamp is None:
@@ -306,6 +487,119 @@ def parse_multipart(handler):
     return None, None
 
 
+def _build_timeseries(records, gps_points=None, max_points=1000):
+    """Build columnar time-series data from record dicts, with downsampling.
+    gps_points: list of (lat, lon, rec_idx) tuples for map-chart linking."""
+    if not records:
+        return {'count': 0}
+    # Build a rec_idx → (lat, lon) lookup from GPS points
+    gps_lookup = {}
+    if gps_points:
+        for pt in gps_points:
+            gps_lookup[pt[2]] = (pt[0], pt[1])
+    # Downsample if needed, tracking original indices
+    indices = list(range(len(records)))
+    if len(records) > max_points:
+        step = len(records) / max_points
+        indices = [int(i * step) for i in range(max_points)]
+        if indices[-1] != len(records) - 1:
+            indices.append(len(records) - 1)
+    pts = [records[i] for i in indices]
+    # Compute elapsed time from first timestamp
+    first_ts = None
+    for r in pts:
+        if 'timestamp' in r:
+            first_ts = r['timestamp']
+            break
+    # Build columnar arrays
+    result = {'count': len(pts)}
+    keys = ['elapsed', 'elevation', 'heart_rate', 'speed', 'cadence', 'power', 'temperature']
+    arrays = {k: [] for k in keys}
+    lat_arr = []
+    lon_arr = []
+    for idx_pos, orig_idx in enumerate(indices):
+        r = pts[idx_pos]
+        ts = r.get('timestamp')
+        arrays['elapsed'].append(round(ts - first_ts, 1) if ts and first_ts else 0)
+        arrays['elevation'].append(r.get('altitude'))
+        arrays['heart_rate'].append(r.get('heart_rate'))
+        arrays['speed'].append(r.get('speed'))
+        arrays['cadence'].append(r.get('cadence'))
+        arrays['power'].append(r.get('power'))
+        arrays['temperature'].append(r.get('temperature'))
+        # GPS lookup for this record index
+        gps = gps_lookup.get(orig_idx)
+        lat_arr.append(gps[0] if gps else None)
+        lon_arr.append(gps[1] if gps else None)
+    # Only include arrays that have at least some non-null values
+    for k in keys:
+        non_null = [v for v in arrays[k] if v is not None]
+        if non_null:
+            result[k] = [v if v is not None else 0 for v in arrays[k]]
+    # Include GPS arrays if any valid points
+    if any(v is not None for v in lat_arr):
+        result['lat'] = lat_arr
+        result['lon'] = lon_arr
+    return result
+
+
+def _compute_zones(records, gps_points=None, max_hr=190, ftp=200):
+    """Compute HR and power zone distributions from record data."""
+    hr_zones = [0] * 5   # Z1-Z5 in seconds
+    power_zones = [0] * 6  # Z1-Z6 in seconds
+    hr_thresholds = [max_hr * p for p in [0.6, 0.7, 0.8, 0.9]]
+    power_thresholds = [ftp * p for p in [0.55, 0.75, 0.90, 1.05, 1.20]]
+    has_hr = False
+    has_power = False
+    for r in records:
+        hr = r.get('heart_rate')
+        pw = r.get('power')
+        if hr is not None and hr > 0:
+            has_hr = True
+            if hr < hr_thresholds[0]:
+                hr_zones[0] += 1
+            elif hr < hr_thresholds[1]:
+                hr_zones[1] += 1
+            elif hr < hr_thresholds[2]:
+                hr_zones[2] += 1
+            elif hr < hr_thresholds[3]:
+                hr_zones[3] += 1
+            else:
+                hr_zones[4] += 1
+        if pw is not None and pw > 0:
+            has_power = True
+            if pw < power_thresholds[0]:
+                power_zones[0] += 1
+            elif pw < power_thresholds[1]:
+                power_zones[1] += 1
+            elif pw < power_thresholds[2]:
+                power_zones[2] += 1
+            elif pw < power_thresholds[3]:
+                power_zones[3] += 1
+            elif pw < power_thresholds[4]:
+                power_zones[4] += 1
+            else:
+                power_zones[5] += 1
+    result = {}
+    if has_hr:
+        total = sum(hr_zones) or 1
+        result['hr'] = {
+            'zones': hr_zones,
+            'pct': [round(z / total * 100, 1) for z in hr_zones],
+            'labels': ['Z1 Recovery', 'Z2 Endurance', 'Z3 Tempo', 'Z4 Threshold', 'Z5 VO2max'],
+            'max_hr': max_hr,
+        }
+    if has_power:
+        total = sum(power_zones) or 1
+        result['power'] = {
+            'zones': power_zones,
+            'pct': [round(z / total * 100, 1) for z in power_zones],
+            'labels': ['Z1 Recovery', 'Z2 Endurance', 'Z3 Tempo', 'Z4 Threshold', 'Z5 VO2max', 'Z6 Anaerobic'],
+            'ftp': ftp,
+        }
+    return result
+
+
 class FITHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -355,9 +649,68 @@ class FITHandler(BaseHTTPRequestHandler):
                 if len(pts) > 2000:
                     step = len(pts) / 2000
                     pts = [pts[int(i * step)] for i in range(2000)] + [pts[-1]]
-                self._send_json({'points': pts})
+                # Return [lat, lon] only (strip rec_idx for map rendering)
+                self._send_json({'points': [[p[0], p[1]] for p in pts]})
             else:
                 self._send_json({'error': 'File not found'}, 404)
+
+        elif path.startswith('/stats/'):
+            file_id = path.split('/stats/')[1]
+            if file_id in uploaded_files:
+                self._send_json(uploaded_files[file_id].get('session_stats', {}))
+            else:
+                self._send_json({'error': 'File not found'}, 404)
+
+        elif path.startswith('/timeseries/'):
+            file_id = path.split('/timeseries/')[1]
+            if file_id in uploaded_files:
+                records = uploaded_files[file_id].get('records', [])
+                gps_pts = uploaded_files[file_id].get('gps_points', [])
+                self._send_json(_build_timeseries(records, gps_pts))
+            else:
+                self._send_json({'error': 'File not found'}, 404)
+
+        elif path.startswith('/laps/'):
+            file_id = path.split('/laps/')[1]
+            if file_id in uploaded_files:
+                self._send_json(uploaded_files[file_id].get('laps', []))
+            else:
+                self._send_json({'error': 'File not found'}, 404)
+
+        elif path.startswith('/zones/'):
+            file_id = path.split('/zones/')[1]
+            qs = urllib.parse.parse_qs(parsed.query)
+            max_hr = int(qs.get('max_hr', [190])[0])
+            ftp = int(qs.get('ftp', [200])[0])
+            if file_id in uploaded_files:
+                records = uploaded_files[file_id].get('records', [])
+                self._send_json(_compute_zones(records, max_hr=max_hr, ftp=ftp))
+            else:
+                self._send_json({'error': 'File not found'}, 404)
+
+        elif path == '/timeseries-multi':
+            qs = urllib.parse.parse_qs(parsed.query)
+            ids = qs.get('ids', [])
+            result = {}
+            for fid in ids:
+                if fid in uploaded_files:
+                    records = uploaded_files[fid].get('records', [])
+                    gps_pts = uploaded_files[fid].get('gps_points', [])
+                    result[fid] = _build_timeseries(records, gps_pts)
+            self._send_json(result)
+
+        elif path == '/gps-multi':
+            qs = urllib.parse.parse_qs(parsed.query)
+            ids = qs.get('ids', [])
+            result = {}
+            for fid in ids:
+                if fid in uploaded_files:
+                    pts = uploaded_files[fid].get('gps_points', [])
+                    if len(pts) > 2000:
+                        step = len(pts) / 2000
+                        pts = [pts[int(i * step)] for i in range(2000)] + [pts[-1]]
+                    result[fid] = {'points': [[p[0], p[1]] for p in pts]}
+            self._send_json(result)
 
         elif path == '/download-zip':
             qs = urllib.parse.parse_qs(parsed.query)
@@ -398,11 +751,16 @@ class FITHandler(BaseHTTPRequestHandler):
             size_kb = len(file_bytes) / 1024
             size_str = f"{size_kb:.0f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
 
+            has_stats = bool(fit.session_stats or fit.records)
+            has_laps = bool(fit.laps)
             uploaded_files[file_id] = {
                 'filename': filename,
                 'bytes': file_bytes,
                 'original_start': start_str,
                 'gps_points': fit.gps_points,
+                'session_stats': fit.session_stats,
+                'records': fit.records,
+                'laps': fit.laps,
             }
 
             self._send_json({
@@ -411,6 +769,9 @@ class FITHandler(BaseHTTPRequestHandler):
                 'original_start': start_str,
                 'size_str': size_str,
                 'gps_count': gps_count,
+                'has_stats': has_stats,
+                'has_laps': has_laps,
+                'lap_count': len(fit.laps),
             })
 
         elif path == '/adjust':
@@ -525,11 +886,13 @@ HTML_PAGE = """<!DOCTYPE html>
   .file-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
   .file-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .file-meta { color: var(--text-muted); font-size: 0.8rem; }
+  .file-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
   .file-remove {
     background: none; border: none; color: var(--danger); cursor: pointer;
     font-size: 1.2rem; padding: 4px 8px; border-radius: 4px; flex-shrink: 0;
   }
   .file-remove:hover { background: #fef2f2; }
+  .file-overlay-cb { width: 16px; height: 16px; cursor: pointer; accent-color: var(--primary); }
   .time-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
   .time-row label { font-weight: 500; font-size: 0.9rem; min-width: 120px; }
   .time-display {
@@ -587,7 +950,6 @@ HTML_PAGE = """<!DOCTYPE html>
     border: 1px solid var(--border);
     position: relative; z-index: 0;
   }
-  /* Ensure Leaflet tile images render correctly */
   .leaflet-container img { max-width: none !important; }
   .map-info {
     font-size: 0.82rem; color: var(--text-muted); margin-top: 8px;
@@ -600,15 +962,106 @@ HTML_PAGE = """<!DOCTYPE html>
     display: inline-block; width: 10px; height: 10px;
     border-radius: 50%; margin-right: 4px; vertical-align: middle;
   }
+  /* Stats card */
+  #stats-card, #charts-card, #laps-card, #zones-card { display: none; }
+  #stats-card.active, #charts-card.active, #laps-card.active, #zones-card.active { display: block; }
+  .stats-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px;
+  }
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+  }
+  .stat-item {
+    background: var(--bg); border-radius: 8px; padding: 12px; text-align: center;
+  }
+  .stat-label {
+    font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--text-muted); margin-bottom: 4px;
+  }
+  .stat-value {
+    font-size: 1.25rem; font-weight: 700; color: var(--text);
+  }
+  .stat-value .stat-unit {
+    font-size: 0.75rem; font-weight: 400; color: var(--text-muted); margin-left: 2px;
+  }
+  .unit-toggle {
+    display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+  }
+  .unit-toggle button {
+    border: none; background: var(--card); color: var(--text-muted);
+    padding: 4px 12px; font-size: 0.78rem; cursor: pointer; transition: all 0.15s;
+  }
+  .unit-toggle button.active {
+    background: var(--primary); color: #fff;
+  }
+  /* Charts */
+  .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 8px; }
+  .chart-tabs {
+    display: flex; gap: 4px; flex-wrap: wrap;
+  }
+  .chart-tab {
+    border: 1px solid var(--border); background: var(--card); color: var(--text-muted);
+    padding: 5px 12px; border-radius: 6px; font-size: 0.8rem; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .chart-tab.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+  .chart-tab:hover:not(.active) { background: var(--bg); }
+  .chart-container { position: relative; width: 100%; height: 280px; }
+  #chartCanvas { width: 100%; height: 100%; }
+  /* Laps table */
+  .laps-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .laps-table th {
+    text-align: left; padding: 8px 10px; font-weight: 600; color: var(--text-muted);
+    font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em;
+    border-bottom: 2px solid var(--border); background: var(--bg);
+  }
+  .laps-table td {
+    padding: 8px 10px; border-bottom: 1px solid var(--border);
+    font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.82rem;
+  }
+  .laps-table tr:last-child td { border-bottom: none; }
+  .laps-table tr:hover td { background: #f1f5f9; }
+  /* Zone bars */
+  .zone-section { margin-bottom: 16px; }
+  .zone-section-title { font-size: 0.82rem; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .zone-inputs { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; font-size: 0.82rem; }
+  .zone-inputs label { color: var(--text-muted); font-size: 0.78rem; }
+  .zone-inputs input {
+    width: 56px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px;
+    text-align: center; font-size: 0.82rem;
+  }
+  .zone-bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .zone-label { width: 100px; font-size: 0.75rem; color: var(--text-muted); text-align: right; flex-shrink: 0; }
+  .zone-bar-bg { flex: 1; height: 22px; background: var(--bg); border-radius: 4px; overflow: hidden; position: relative; }
+  .zone-bar-fill { height: 100%; border-radius: 4px; transition: width 0.4s; display: flex; align-items: center; justify-content: flex-end; padding-right: 6px; min-width: 2px; }
+  .zone-bar-text { font-size: 0.7rem; color: white; font-weight: 600; white-space: nowrap; }
+  .zone-time { width: 60px; font-size: 0.75rem; color: var(--text-muted); font-family: monospace; }
+  /* Overlay legend */
+  .overlay-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; font-size: 0.78rem; }
+  .overlay-legend-item { display: flex; align-items: center; gap: 4px; }
+  .overlay-swatch { width: 14px; height: 3px; border-radius: 2px; }
+  /* Map cursor marker */
+  .map-cursor-marker {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--primary); border: 2px solid white;
+    box-shadow: 0 0 6px rgba(37,99,235,0.5);
+  }
+
   @media (max-width: 600px) {
     body { padding: 12px; }
     .time-row { flex-direction: column; align-items: flex-start; }
     .time-row label { min-width: auto; }
     #map { height: 300px; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .chart-container { height: 220px; }
   }
 </style>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" crossorigin="anonymous" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.2.0/chartjs-plugin-zoom.min.js" crossorigin="anonymous"></script>
 </head>
 <body>
 <div class="container">
@@ -629,10 +1082,51 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="card-title">Route Map</div>
     <div id="map"></div>
     <div class="map-info" id="mapInfo"></div>
-    <div class="map-legend">
+    <div class="map-legend" id="mapLegend">
       <span><span class="legend-dot" style="background:#22c55e"></span>Start</span>
       <span><span class="legend-dot" style="background:#ef4444"></span>Finish</span>
     </div>
+  </div>
+
+  <div class="card" id="charts-card">
+    <div class="card-header">
+      <div class="card-title">Charts</div>
+      <div class="chart-header">
+        <div class="chart-tabs" id="chartTabs"></div>
+        <button class="btn btn-secondary btn-sm" id="resetZoomBtn" onclick="resetChartZoom()" style="display:none">Reset Zoom</button>
+      </div>
+      <div class="overlay-legend" id="overlayLegend" style="display:none"></div>
+    </div>
+    <div class="chart-container"><canvas id="chartCanvas"></canvas></div>
+  </div>
+
+  <div class="card" id="stats-card">
+    <div class="stats-header">
+      <div class="card-title" style="margin-bottom:0">Activity Stats</div>
+      <div class="unit-toggle">
+        <button class="active" onclick="setUnits('metric')">Metric</button>
+        <button onclick="setUnits('imperial')">Imperial</button>
+      </div>
+    </div>
+    <div class="stats-grid" id="statsGrid"></div>
+  </div>
+
+  <div class="card" id="laps-card">
+    <div class="card-title">Lap Splits</div>
+    <div style="overflow-x:auto"><table class="laps-table" id="lapsTable"></table></div>
+  </div>
+
+  <div class="card" id="zones-card">
+    <div class="card-title">Zone Analysis</div>
+    <div class="zone-inputs" id="zoneInputs">
+      <label>Age:</label>
+      <input type="number" id="zoneAge" value="30" min="10" max="99" onchange="reloadZones()">
+      <label>Max HR:</label>
+      <input type="number" id="zoneMaxHR" value="190" min="100" max="230" onchange="reloadZones()">
+      <label>FTP (W):</label>
+      <input type="number" id="zoneFTP" value="200" min="50" max="500" onchange="reloadZones()">
+    </div>
+    <div id="zoneContent"></div>
   </div>
 
   <div class="card">
@@ -693,6 +1187,11 @@ let resultIds = [];
 let map = null;
 let routeLayer = null;
 let markerLayer = null;
+let cursorMarker = null;
+
+// ---- Multi-file overlay ----
+let overlayFileIds = [];  // files selected for overlay
+const OVERLAY_COLORS = ['#2563eb','#dc2626','#16a34a','#f59e0b','#8b5cf6','#ec4899','#14b8a6','#f97316'];
 
 function initMap() {
   if (map) return;
@@ -707,59 +1206,55 @@ function initMap() {
   }).addTo(map);
   routeLayer = L.layerGroup().addTo(map);
   markerLayer = L.layerGroup().addTo(map);
+
+  // Cursor marker for chart-map linking
+  const icon = L.divIcon({ className: 'map-cursor-marker', iconSize: [14, 14], iconAnchor: [7, 7] });
+  cursorMarker = L.marker([0, 0], { icon: icon, interactive: false }).addTo(map);
+  cursorMarker.setOpacity(0);
 }
 
-async function loadRoute(fileId) {
+async function loadRoute(fileId, color, showMarkers) {
   try {
     const r = await fetch('/gps/' + fileId);
     const d = await r.json();
     if (d.error || !d.points || d.points.length < 2) return;
 
-    // IMPORTANT: make the card visible BEFORE initializing the map
-    // Leaflet needs a visible container with real dimensions to render tiles
     const mapCard = document.getElementById('map-card');
     mapCard.classList.add('active');
-
-    // Small delay to let the browser layout the visible container
     await new Promise(resolve => setTimeout(resolve, 50));
-
     initMap();
-    routeLayer.clearLayers();
-    markerLayer.clearLayers();
 
     const latlngs = d.points.map(p => [p[0], p[1]]);
+    color = color || '#2563eb';
 
-    // Route line
-    L.polyline(latlngs, { color: '#2563eb', weight: 3.5, opacity: 0.85 }).addTo(routeLayer);
+    L.polyline(latlngs, { color: color, weight: 3.5, opacity: 0.85 }).addTo(routeLayer);
 
-    // Start marker (green)
-    L.circleMarker(latlngs[0], {
-      radius: 8, fillColor: '#22c55e', color: '#fff', weight: 2, fillOpacity: 1
-    }).bindPopup('Start').addTo(markerLayer);
+    if (showMarkers !== false) {
+      L.circleMarker(latlngs[0], {
+        radius: 8, fillColor: '#22c55e', color: '#fff', weight: 2, fillOpacity: 1
+      }).bindPopup('Start').addTo(markerLayer);
+      L.circleMarker(latlngs[latlngs.length - 1], {
+        radius: 8, fillColor: '#ef4444', color: '#fff', weight: 2, fillOpacity: 1
+      }).bindPopup('Finish').addTo(markerLayer);
+    }
 
-    // Finish marker (red)
-    L.circleMarker(latlngs[latlngs.length - 1], {
-      radius: 8, fillColor: '#ef4444', color: '#fff', weight: 2, fillOpacity: 1
-    }).bindPopup('Finish').addTo(markerLayer);
-
-    // Fit bounds
     const bounds = L.latLngBounds(latlngs).pad(0.05);
     map.fitBounds(bounds);
-
-    // Info
     document.getElementById('mapInfo').textContent = d.points.length + ' GPS points';
-
-    // Force Leaflet to recalculate container size and reload tiles
     setTimeout(() => { map.invalidateSize(); map.fitBounds(bounds); }, 200);
   } catch (e) {
     console.warn('Map load error:', e);
   }
 }
 
-function hideMap() {
-  document.getElementById('map-card').classList.remove('active');
+function clearMapLayers() {
   if (routeLayer) routeLayer.clearLayers();
   if (markerLayer) markerLayer.clearLayers();
+}
+
+function hideMap() {
+  document.getElementById('map-card').classList.remove('active');
+  clearMapLayers();
   document.getElementById('mapInfo').textContent = '';
 }
 
@@ -788,12 +1283,14 @@ async function uploadFile(file) {
     files[d.id] = d;
     renderFileList();
     const gpsNote = d.gps_count > 0 ? ', ' + d.gps_count + ' GPS points' : '';
-    log('Added: ' + d.filename + ' (start: ' + (d.original_start || 'N/A') + gpsNote + ')', 'info');
+    const lapNote = d.has_laps ? ', ' + d.lap_count + ' laps' : '';
+    log('Added: ' + d.filename + ' (start: ' + (d.original_start || 'N/A') + gpsNote + lapNote + ')', 'info');
     if (Object.keys(files).length === 1 && d.original_start) {
       document.getElementById('originalTime').textContent = d.original_start + ' UTC';
     }
-    // Load route map for the first file with GPS data
     if (d.gps_count > 0) loadRoute(d.id);
+    if (d.has_stats) loadStats(d.id);
+    if (d.has_laps) loadLaps(d.id);
     updateBtn();
   } catch (e) { log('Upload failed: ' + e.message, 'error'); }
 }
@@ -801,25 +1298,34 @@ async function uploadFile(file) {
 function removeFile(id) {
   fetch('/remove/' + id, { method: 'DELETE' });
   delete files[id];
+  overlayFileIds = overlayFileIds.filter(x => x !== id);
   renderFileList(); updateBtn();
   const keys = Object.keys(files);
   document.getElementById('originalTime').textContent =
     keys.length > 0 ? (files[keys[0]].original_start || '\\u2014') + ' UTC' : '\\u2014';
-  // Update map: show first remaining file's route, or hide map
   if (keys.length > 0) {
     const first = files[keys[0]];
     if (first.gps_count > 0) loadRoute(keys[0]); else hideMap();
-  } else { hideMap(); }
+    if (first.has_stats) loadStats(keys[0]); else hideStats();
+    if (first.has_laps) loadLaps(keys[0]); else hideLaps();
+  } else { hideMap(); hideStats(); hideLaps(); hideZones(); }
+  if (overlayFileIds.length > 1) refreshOverlay();
 }
 
 function renderFileList() {
   fileList.innerHTML = '';
+  const multiFile = Object.keys(files).length > 1;
   for (const [id, f] of Object.entries(files)) {
     const li = document.createElement('li'); li.className = 'file-item';
+    const overlayCheck = multiFile
+      ? '<input type="checkbox" class="file-overlay-cb" ' + (overlayFileIds.includes(id) ? 'checked' : '') +
+        ' onchange="toggleOverlay(\\'' + id + '\\', this.checked)" title="Include in overlay">'
+      : '';
     li.innerHTML = '<div class="file-info"><span class="file-name">' + f.filename +
       '</span><span class="file-meta">Start: ' + (f.original_start || 'N/A') +
       ' UTC &middot; ' + f.size_str + '</span></div>' +
-      '<button class="file-remove" onclick="removeFile(\\'' + id + '\\')" title="Remove">&times;</button>';
+      '<div class="file-actions">' + overlayCheck +
+      '<button class="file-remove" onclick="removeFile(\\'' + id + '\\')" title="Remove">&times;</button></div>';
     fileList.appendChild(li);
   }
 }
@@ -933,16 +1439,13 @@ document.querySelectorAll('.time-inputs input').forEach(el => {
     let vals = fields.map((_, i) => getVal(i));
     vals[idx] += delta;
 
-    // Cascade carry from seconds up to year
     for (let i = 5; i >= 1; i--) {
       const mx = (i === 2) ? daysInMonth(vals[0], vals[1]) : maxes[i];
       const mn = mins[i];
       if (vals[i] > mx) { vals[i] = mn; if (i > 0) vals[i-1]++; }
       else if (vals[i] < mn) { vals[i] = mx; if (i > 0) vals[i-1]--; }
     }
-    // Clamp year
     vals[0] = Math.max(mins[0], Math.min(maxes[0], vals[0]));
-    // Clamp day to valid range for the resulting month
     vals[2] = Math.min(vals[2], daysInMonth(vals[0], vals[1]));
 
     vals.forEach((v, i) => setVal(i, v));
@@ -957,9 +1460,523 @@ document.querySelectorAll('.time-inputs input').forEach(el => {
 })();
 
 useCurrentTime();
+
+// ---- Stats & Charts ----
+let currentStats = null;
+let currentTimeseries = null;
+let currentChart = null;
+let activeTab = null;
+let unitSystem = 'metric';
+let currentFileId = null;  // track which file's data is displayed
+
+const CONVERSIONS = {
+  metric: {
+    dist: v => v / 1000, distUnit: 'km',
+    elev: v => v, elevUnit: 'm',
+    speed: v => v * 3.6, speedUnit: 'km/h',
+    temp: v => v, tempUnit: '\\u00b0C',
+  },
+  imperial: {
+    dist: v => v / 1609.344, distUnit: 'mi',
+    elev: v => v * 3.28084, elevUnit: 'ft',
+    speed: v => v * 2.23694, speedUnit: 'mph',
+    temp: v => v * 9/5 + 32, tempUnit: '\\u00b0F',
+  }
+};
+
+function conv() { return CONVERSIONS[unitSystem]; }
+
+function fmtDuration(sec) {
+  if (!sec) return '\\u2014';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  return h > 0 ? h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0')
+    : m + ':' + String(s).padStart(2,'0');
+}
+
+function fmtElapsed(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) return h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+  return m + ':' + String(s).padStart(2,'0');
+}
+
+function setUnits(u) {
+  unitSystem = u;
+  document.querySelectorAll('.unit-toggle button').forEach(b => {
+    b.classList.toggle('active', b.textContent.toLowerCase() === u);
+  });
+  if (currentStats) renderStats(currentStats);
+  if (currentTimeseries && activeTab) renderChart(activeTab);
+  if (currentLaps) renderLaps(currentLaps);
+}
+
+function renderStats(stats) {
+  const c = conv();
+  const items = [];
+  const addStat = (label, val, unit) => {
+    if (val !== undefined && val !== null) items.push({label, val, unit});
+  };
+  if (stats.total_distance !== undefined) addStat('Distance', c.dist(stats.total_distance).toFixed(2), c.distUnit);
+  if (stats.total_timer_time !== undefined) addStat('Duration', fmtDuration(stats.total_timer_time), '');
+  if (stats.avg_speed !== undefined) addStat('Avg Speed', c.speed(stats.avg_speed).toFixed(1), c.speedUnit);
+  if (stats.total_ascent !== undefined) addStat('Ascent', Math.round(c.elev(stats.total_ascent)), c.elevUnit);
+  if (stats.total_descent !== undefined) addStat('Descent', Math.round(c.elev(stats.total_descent)), c.elevUnit);
+  if (stats.avg_heart_rate !== undefined) addStat('Avg HR', stats.avg_heart_rate, 'bpm');
+  if (stats.max_heart_rate !== undefined) addStat('Max HR', stats.max_heart_rate, 'bpm');
+  if (stats.avg_power !== undefined) addStat('Avg Power', stats.avg_power, 'W');
+  if (stats.max_power !== undefined) addStat('Max Power', stats.max_power, 'W');
+  if (stats.normalized_power !== undefined) addStat('NP', stats.normalized_power, 'W');
+  if (stats.total_calories !== undefined) addStat('Calories', stats.total_calories, 'kcal');
+  if (stats.avg_cadence !== undefined) addStat('Avg Cadence', stats.avg_cadence, 'rpm');
+  if (stats.max_cadence !== undefined) addStat('Max Cadence', stats.max_cadence, 'rpm');
+  if (stats.avg_temperature !== undefined) addStat('Avg Temp', Math.round(c.temp(stats.avg_temperature)), c.tempUnit);
+  if (stats.max_speed !== undefined) addStat('Max Speed', c.speed(stats.max_speed).toFixed(1), c.speedUnit);
+
+  const grid = document.getElementById('statsGrid');
+  grid.innerHTML = items.map(i =>
+    '<div class="stat-item"><div class="stat-label">' + i.label +
+    '</div><div class="stat-value">' + i.val +
+    (i.unit ? '<span class="stat-unit">' + i.unit + '</span>' : '') +
+    '</div></div>'
+  ).join('');
+}
+
+// ---- Chart definitions ----
+const CHART_DEFS = {
+  elevation: { key: 'elevation', label: 'Elevation', color: '#64748b', unitFn: c => c.elevUnit, convFn: (v, c) => c.elev(v) },
+  speed:     { key: 'speed', label: 'Speed', color: '#2563eb', unitFn: c => c.speedUnit, convFn: (v, c) => c.speed(v) },
+  heart_rate:{ key: 'heart_rate', label: 'Heart Rate', color: '#dc2626', unitFn: () => 'bpm', convFn: v => v },
+  cadence:   { key: 'cadence', label: 'Cadence', color: '#9333ea', unitFn: () => 'rpm', convFn: v => v },
+  power:     { key: 'power', label: 'Power', color: '#ea580c', unitFn: () => 'W', convFn: v => v },
+  temperature:{ key: 'temperature', label: 'Temperature', color: '#0d9488', unitFn: c => c.tempUnit, convFn: (v, c) => c.temp(v) },
+};
+
+function buildChartTabs(ts) {
+  const tabsEl = document.getElementById('chartTabs');
+  tabsEl.innerHTML = '';
+  let first = null;
+  for (const [id, def] of Object.entries(CHART_DEFS)) {
+    if (!ts[def.key]) continue;
+    if (!first) first = id;
+    const btn = document.createElement('button');
+    btn.className = 'chart-tab';
+    btn.textContent = def.label;
+    btn.dataset.chart = id;
+    btn.onclick = () => {
+      tabsEl.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderChart(id);
+    };
+    tabsEl.appendChild(btn);
+  }
+  return first;
+}
+
+function renderChart(tabId) {
+  activeTab = tabId;
+  const def = CHART_DEFS[tabId];
+  if (!def || !currentTimeseries || !currentTimeseries[def.key]) return;
+  if (typeof Chart === 'undefined') { console.error('Chart.js not loaded'); return; }
+  const c = conv();
+  const elapsed = currentTimeseries.elapsed || [];
+  const rawData = currentTimeseries[def.key];
+  const data = rawData.map(v => {
+    const cv = def.convFn(v, c);
+    return Math.round(cv * 100) / 100;
+  });
+  const labels = elapsed.map(s => fmtElapsed(s));
+  const unit = def.unitFn(c);
+
+  if (currentChart) { currentChart.destroy(); currentChart = null; }
+
+  const container = document.querySelector('.chart-container');
+  container.innerHTML = '<canvas id="chartCanvas"></canvas>';
+  const canvas = document.getElementById('chartCanvas');
+  document.getElementById('resetZoomBtn').style.display = 'inline-flex';
+
+  currentChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: def.label + ' (' + unit + ')',
+        data: data,
+        borderColor: def.color,
+        backgroundColor: def.color + '1a',
+        fill: true,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: items => 'Time: ' + items[0].label,
+            label: item => def.label + ': ' + item.formattedValue + ' ' + unit
+          }
+        },
+        zoom: {
+          zoom: {
+            drag: { enabled: true, backgroundColor: 'rgba(37,99,235,0.1)', borderColor: 'rgba(37,99,235,0.4)', borderWidth: 1 },
+            mode: 'x',
+          },
+          limits: { x: { minRange: 5 } }
+        }
+      },
+      scales: {
+        x: {
+          display: true,
+          ticks: { maxTicksLimit: 8, font: { size: 11 } },
+          grid: { display: false },
+        },
+        y: {
+          display: true,
+          title: { display: true, text: unit, font: { size: 11 } },
+          ticks: { font: { size: 11 } },
+          grid: { color: '#e2e8f022' },
+        }
+      },
+      onHover: (event, elements, chart) => {
+        if (!currentTimeseries || !currentTimeseries.lat) return;
+        if (!elements || elements.length === 0) {
+          if (cursorMarker) cursorMarker.setOpacity(0);
+          return;
+        }
+        const idx = elements[0].index;
+        const lat = currentTimeseries.lat[idx];
+        const lon = currentTimeseries.lon[idx];
+        if (lat && lon && cursorMarker && map) {
+          cursorMarker.setLatLng([lat, lon]);
+          cursorMarker.setOpacity(1);
+        }
+      }
+    }
+  });
+}
+
+function resetChartZoom() {
+  if (currentChart) currentChart.resetZoom();
+}
+
+// ---- Multi-file overlay chart ----
+let overlayTimeseries = {};  // { fileId: timeseries }
+
+function renderOverlayChart(tabId) {
+  activeTab = tabId;
+  const def = CHART_DEFS[tabId];
+  if (!def) return;
+  if (typeof Chart === 'undefined') return;
+  const c = conv();
+  const unit = def.unitFn(c);
+
+  if (currentChart) { currentChart.destroy(); currentChart = null; }
+  const container = document.querySelector('.chart-container');
+  container.innerHTML = '<canvas id="chartCanvas"></canvas>';
+  const canvas = document.getElementById('chartCanvas');
+  document.getElementById('resetZoomBtn').style.display = 'inline-flex';
+
+  const datasets = [];
+  let maxLabels = [];
+  overlayFileIds.forEach((fid, i) => {
+    const ts = overlayTimeseries[fid];
+    if (!ts || !ts[def.key]) return;
+    const rawData = ts[def.key];
+    const data = rawData.map(v => Math.round(def.convFn(v, c) * 100) / 100);
+    const elapsed = ts.elapsed || [];
+    const labels = elapsed.map(s => fmtElapsed(s));
+    if (labels.length > maxLabels.length) maxLabels = labels;
+    const color = OVERLAY_COLORS[i % OVERLAY_COLORS.length];
+    datasets.push({
+      label: (files[fid] ? files[fid].filename : fid),
+      data: data,
+      borderColor: color,
+      backgroundColor: color + '1a',
+      fill: false,
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.3,
+    });
+  });
+
+  if (datasets.length === 0) return;
+
+  currentChart = new Chart(canvas, {
+    type: 'line',
+    data: { labels: maxLabels, datasets: datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: true, labels: { boxWidth: 12, font: { size: 11 } } },
+        zoom: {
+          zoom: {
+            drag: { enabled: true, backgroundColor: 'rgba(37,99,235,0.1)', borderColor: 'rgba(37,99,235,0.4)', borderWidth: 1 },
+            mode: 'x',
+          },
+          limits: { x: { minRange: 5 } }
+        }
+      },
+      scales: {
+        x: { display: true, ticks: { maxTicksLimit: 8, font: { size: 11 } }, grid: { display: false } },
+        y: { display: true, title: { display: true, text: unit, font: { size: 11 } }, ticks: { font: { size: 11 } } }
+      }
+    }
+  });
+}
+
+function toggleOverlay(fileId, checked) {
+  if (checked && !overlayFileIds.includes(fileId)) overlayFileIds.push(fileId);
+  if (!checked) overlayFileIds = overlayFileIds.filter(x => x !== fileId);
+  if (overlayFileIds.length > 1) refreshOverlay();
+  else {
+    // Revert to single-file view
+    document.getElementById('overlayLegend').style.display = 'none';
+    overlayTimeseries = {};
+    const keys = Object.keys(files);
+    if (keys.length > 0) {
+      const first = overlayFileIds.length === 1 ? overlayFileIds[0] : keys[0];
+      clearMapLayers();
+      if (files[first].gps_count > 0) loadRoute(first);
+      if (files[first].has_stats) loadStats(first);
+    }
+  }
+}
+
+async function refreshOverlay() {
+  if (overlayFileIds.length < 2) return;
+  // Load multi timeseries
+  const url = '/timeseries-multi?ids=' + overlayFileIds.join('&ids=');
+  try {
+    const r = await fetch(url);
+    overlayTimeseries = await r.json();
+  } catch (e) { console.warn('Multi timeseries error:', e); return; }
+
+  // Find available tabs across all files
+  const allKeys = new Set();
+  for (const fid of overlayFileIds) {
+    const ts = overlayTimeseries[fid];
+    if (ts) for (const [id, def] of Object.entries(CHART_DEFS)) {
+      if (ts[def.key]) allKeys.add(id);
+    }
+  }
+
+  // Build tabs
+  const tabsEl = document.getElementById('chartTabs');
+  tabsEl.innerHTML = '';
+  let first = null;
+  for (const id of Object.keys(CHART_DEFS)) {
+    if (!allKeys.has(id)) continue;
+    if (!first) first = id;
+    const btn = document.createElement('button');
+    btn.className = 'chart-tab' + (id === first ? ' active' : '');
+    btn.textContent = CHART_DEFS[id].label;
+    btn.onclick = () => {
+      tabsEl.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderOverlayChart(id);
+    };
+    tabsEl.appendChild(btn);
+  }
+
+  document.getElementById('charts-card').classList.add('active');
+
+  // Build overlay legend
+  const legendEl = document.getElementById('overlayLegend');
+  legendEl.style.display = 'flex';
+  legendEl.innerHTML = overlayFileIds.map((fid, i) => {
+    const color = OVERLAY_COLORS[i % OVERLAY_COLORS.length];
+    const name = files[fid] ? files[fid].filename : fid;
+    return '<span class="overlay-legend-item"><span class="overlay-swatch" style="background:' + color + '"></span>' + name + '</span>';
+  }).join('');
+
+  // Overlay routes on map
+  clearMapLayers();
+  const mapCard = document.getElementById('map-card');
+  let anyGps = false;
+  for (let i = 0; i < overlayFileIds.length; i++) {
+    const fid = overlayFileIds[i];
+    if (files[fid] && files[fid].gps_count > 0) {
+      anyGps = true;
+      await loadRoute(fid, OVERLAY_COLORS[i % OVERLAY_COLORS.length], i === 0);
+    }
+  }
+  if (!anyGps) hideMap();
+
+  if (first) renderOverlayChart(first);
+}
+
+async function loadStats(fileId) {
+  currentFileId = fileId;
+  try {
+    const [statsR, tsR] = await Promise.all([
+      fetch('/stats/' + fileId),
+      fetch('/timeseries/' + fileId)
+    ]);
+    currentStats = await statsR.json();
+    currentTimeseries = await tsR.json();
+
+    if (currentStats && Object.keys(currentStats).length > 0) {
+      document.getElementById('stats-card').classList.add('active');
+      renderStats(currentStats);
+      // Update max HR from stats if available
+      if (currentStats.max_heart_rate) {
+        document.getElementById('zoneMaxHR').value = currentStats.max_heart_rate;
+      }
+    }
+
+    if (currentTimeseries && currentTimeseries.count > 0) {
+      document.getElementById('charts-card').classList.add('active');
+      document.getElementById('overlayLegend').style.display = 'none';
+      const firstTab = buildChartTabs(currentTimeseries);
+      if (firstTab) {
+        document.querySelector('.chart-tab').classList.add('active');
+        renderChart(firstTab);
+      }
+    }
+    // Load zones
+    loadZones(fileId);
+  } catch (e) { console.warn('Stats load error:', e); }
+}
+
+function hideStats() {
+  document.getElementById('stats-card').classList.remove('active');
+  document.getElementById('charts-card').classList.remove('active');
+  document.getElementById('resetZoomBtn').style.display = 'none';
+  if (currentChart) { currentChart.destroy(); currentChart = null; }
+  currentStats = null;
+  currentTimeseries = null;
+  activeTab = null;
+}
+
+// ---- Laps ----
+let currentLaps = null;
+
+async function loadLaps(fileId) {
+  try {
+    const r = await fetch('/laps/' + fileId);
+    currentLaps = await r.json();
+    if (currentLaps && currentLaps.length > 0) {
+      document.getElementById('laps-card').classList.add('active');
+      renderLaps(currentLaps);
+    }
+  } catch (e) { console.warn('Laps load error:', e); }
+}
+
+function renderLaps(laps) {
+  const c = conv();
+  const tbl = document.getElementById('lapsTable');
+  // Determine available columns
+  const cols = [{ key: 'lap', label: '#' }];
+  const colDefs = [
+    { key: 'total_timer_time', label: 'Duration', fmt: v => fmtDuration(v) },
+    { key: 'total_distance', label: 'Distance', fmt: v => c.dist(v).toFixed(2) + ' ' + c.distUnit },
+    { key: 'avg_speed', label: 'Avg Speed', fmt: v => c.speed(v).toFixed(1) + ' ' + c.speedUnit },
+    { key: 'avg_heart_rate', label: 'Avg HR', fmt: v => v + ' bpm' },
+    { key: 'max_heart_rate', label: 'Max HR', fmt: v => v + ' bpm' },
+    { key: 'avg_power', label: 'Avg Power', fmt: v => v + ' W' },
+    { key: 'avg_cadence', label: 'Cadence', fmt: v => v + ' rpm' },
+    { key: 'total_ascent', label: 'Ascent', fmt: v => Math.round(c.elev(v)) + ' ' + c.elevUnit },
+    { key: 'total_calories', label: 'Cal', fmt: v => v },
+  ];
+  for (const cd of colDefs) {
+    if (laps.some(l => l[cd.key] !== undefined)) cols.push(cd);
+  }
+  let html = '<thead><tr>' + cols.map(c => '<th>' + c.label + '</th>').join('') + '</tr></thead><tbody>';
+  laps.forEach((lap, i) => {
+    html += '<tr>';
+    for (const col of cols) {
+      if (col.key === 'lap') { html += '<td>' + (i + 1) + '</td>'; continue; }
+      const v = lap[col.key];
+      html += '<td>' + (v !== undefined ? col.fmt(v) : '\\u2014') + '</td>';
+    }
+    html += '</tr>';
+  });
+  html += '</tbody>';
+  tbl.innerHTML = html;
+}
+
+function hideLaps() {
+  document.getElementById('laps-card').classList.remove('active');
+  currentLaps = null;
+}
+
+// ---- Zones ----
+const HR_ZONE_COLORS = ['#3b82f6','#22c55e','#eab308','#f97316','#ef4444'];
+const PW_ZONE_COLORS = ['#93c5fd','#60a5fa','#3b82f6','#2563eb','#1d4ed8','#1e3a8a'];
+
+function updateMaxHRFromAge() {
+  const age = parseInt(document.getElementById('zoneAge').value) || 30;
+  document.getElementById('zoneMaxHR').value = 220 - age;
+  reloadZones();
+}
+
+// Attach age → maxHR update
+document.getElementById('zoneAge').addEventListener('change', updateMaxHRFromAge);
+
+async function loadZones(fileId) {
+  currentFileId = fileId;
+  const maxHR = parseInt(document.getElementById('zoneMaxHR').value) || 190;
+  const ftp = parseInt(document.getElementById('zoneFTP').value) || 200;
+  try {
+    const r = await fetch('/zones/' + fileId + '?max_hr=' + maxHR + '&ftp=' + ftp);
+    const zones = await r.json();
+    if (zones && (zones.hr || zones.power)) {
+      document.getElementById('zones-card').classList.add('active');
+      renderZones(zones);
+    }
+  } catch (e) { console.warn('Zones load error:', e); }
+}
+
+function reloadZones() {
+  if (currentFileId) loadZones(currentFileId);
+}
+
+function renderZones(zones) {
+  const content = document.getElementById('zoneContent');
+  let html = '';
+  if (zones.hr) {
+    html += '<div class="zone-section"><div class="zone-section-title">Heart Rate Zones (Max HR: ' + zones.hr.max_hr + ' bpm)</div>';
+    zones.hr.labels.forEach((label, i) => {
+      const pct = zones.hr.pct[i];
+      const secs = zones.hr.zones[i];
+      html += '<div class="zone-bar-row"><span class="zone-label">' + label + '</span>' +
+        '<div class="zone-bar-bg"><div class="zone-bar-fill" style="width:' + Math.max(pct, 1) + '%;background:' + HR_ZONE_COLORS[i] + '">' +
+        '<span class="zone-bar-text">' + pct + '%</span></div></div>' +
+        '<span class="zone-time">' + fmtDuration(secs) + '</span></div>';
+    });
+    html += '</div>';
+  }
+  if (zones.power) {
+    html += '<div class="zone-section"><div class="zone-section-title">Power Zones (FTP: ' + zones.power.ftp + ' W)</div>';
+    zones.power.labels.forEach((label, i) => {
+      const pct = zones.power.pct[i];
+      const secs = zones.power.zones[i];
+      html += '<div class="zone-bar-row"><span class="zone-label">' + label + '</span>' +
+        '<div class="zone-bar-bg"><div class="zone-bar-fill" style="width:' + Math.max(pct, 1) + '%;background:' + PW_ZONE_COLORS[i] + '">' +
+        '<span class="zone-bar-text">' + pct + '%</span></div></div>' +
+        '<span class="zone-time">' + fmtDuration(secs) + '</span></div>';
+    });
+    html += '</div>';
+  }
+  content.innerHTML = html;
+}
+
+function hideZones() {
+  document.getElementById('zones-card').classList.remove('active');
+  document.getElementById('zoneContent').innerHTML = '';
+}
 </script>
 </body>
 </html>"""
+
 
 
 # ==============================================================================
