@@ -1,0 +1,9 @@
+services:
+  fit-toolkit:
+    build: .
+    ports:
+      - "5050:5050"
+    volumes:
+      - ./fit_toolkit.py:/app/fit_toolkit.py
+    environment:
+      - RELOAD=1
