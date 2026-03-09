@@ -107,6 +107,17 @@ LAP_FIELDS = {
     125: ('enhanced_max_speed', 'I', 1000),
 }
 
+# Default thresholds for moment detection
+DEFAULT_SPEED_SURGE_THRESHOLD = 13.89   # m/s (50 km/h)
+DEFAULT_POWER_SPIKE_THRESHOLD = 400     # watts
+DEFAULT_SPRINT_POWER_THRESHOLD = 400    # watts
+DEFAULT_SPRINT_ACCEL_THRESHOLD = 1.0    # m/s²
+DEFAULT_SPRINT_MIN_DURATION = 3         # seconds
+DEFAULT_CLIMB_GRADIENT_THRESHOLD = 0.05 # 5%
+DEFAULT_CLIMB_MIN_DURATION = 30         # seconds
+DEFAULT_CLIMB_MIN_ELEVATION_GAIN = 10   # meters
+DEFAULT_GROUP_TIME_WINDOW = 60          # seconds
+
 # Record fields to extract: field_def_num → (name, format, scale_divisor, offset_sub)
 RECORD_FIELDS = {
     253: ('timestamp', 'I', 1, 0),
@@ -564,6 +575,1087 @@ def compute_route_similarity(gps_a, gps_b):
 
 
 # ==============================================================================
+# Moment Detection & Group Analysis
+# ==============================================================================
+
+def _parse_thresholds(qs):
+    """Extract moment detection thresholds from query string with defaults."""
+    def _f(key, default):
+        return float(qs.get(key, [default])[0])
+    return {
+        'speed_surge': _f('speed_surge', DEFAULT_SPEED_SURGE_THRESHOLD),
+        'power_spike': _f('power_spike', DEFAULT_POWER_SPIKE_THRESHOLD),
+        'sprint_power': _f('sprint_power', DEFAULT_SPRINT_POWER_THRESHOLD),
+        'sprint_accel': _f('sprint_accel', DEFAULT_SPRINT_ACCEL_THRESHOLD),
+        'sprint_min_duration': _f('sprint_min_duration', DEFAULT_SPRINT_MIN_DURATION),
+        'climb_gradient': _f('climb_gradient', DEFAULT_CLIMB_GRADIENT_THRESHOLD),
+        'climb_min_duration': _f('climb_min_duration', DEFAULT_CLIMB_MIN_DURATION),
+        'climb_min_elevation_gain': _f('climb_min_elevation_gain', DEFAULT_CLIMB_MIN_ELEVATION_GAIN),
+    }
+
+
+def detect_moments(records, gps_points, thresholds):
+    """Detect notable moments (speed surges, power spikes, sprints, climbs) from records."""
+    # Build rec_idx → (lat, lon) lookup
+    gps_lookup = {}
+    if gps_points:
+        for pt in gps_points:
+            gps_lookup[pt[2]] = (pt[0], pt[1])
+
+    moments = []
+
+    # Sprint state machine
+    sprint_active = False
+    sprint_start_ts = 0
+    sprint_start_idx = 0
+    sprint_peak_power = 0
+    sprint_peak_speed = 0
+    sprint_last_ts = 0
+
+    # Climb state machine
+    climb_active = False
+    climb_start_ts = 0
+    climb_start_idx = 0
+    climb_start_alt = 0
+    climb_elevation_gain = 0
+    climb_last_alt = 0
+    climb_last_ts = 0
+
+    prev_speed = None
+    prev_ts = None
+
+    for i, rec in enumerate(records):
+        ts = rec.get('timestamp')
+        speed = rec.get('speed')
+        power = rec.get('power')
+        alt = rec.get('altitude')
+        dist = rec.get('distance')
+
+        gps = gps_lookup.get(i)
+        lat = gps[0] if gps else None
+        lon = gps[1] if gps else None
+
+        if ts is None:
+            continue
+
+        # Speed surge detection
+        if speed is not None and speed > thresholds['speed_surge']:
+            moments.append({
+                'type': 'speed_surge',
+                'timestamp': ts,
+                'value': round(speed, 2),
+                'lat': lat, 'lon': lon,
+            })
+
+        # Power spike detection
+        if power is not None and power > 0 and power > thresholds['power_spike']:
+            moments.append({
+                'type': 'power_spike',
+                'timestamp': ts,
+                'value': round(power, 1),
+                'lat': lat, 'lon': lon,
+            })
+
+        # Acceleration calculation
+        accel = 0
+        if speed is not None and prev_speed is not None and prev_ts is not None:
+            dt = ts - prev_ts
+            if 0 < dt <= 5:
+                accel = (speed - prev_speed) / dt
+
+        # Sprint state machine
+        is_sprint_trigger = (
+            (power is not None and power > thresholds['sprint_power']) or
+            (accel > thresholds['sprint_accel']) or
+            (speed is not None and speed > thresholds['speed_surge'])
+        )
+
+        if sprint_active:
+            gap = ts - sprint_last_ts if sprint_last_ts else 0
+            if gap > 5 or not is_sprint_trigger:
+                # End sprint
+                duration = sprint_last_ts - sprint_start_ts
+                if duration >= thresholds['sprint_min_duration']:
+                    s_gps = gps_lookup.get(sprint_start_idx)
+                    moments.append({
+                        'type': 'sprint',
+                        'timestamp': sprint_start_ts,
+                        'value': round(sprint_peak_power, 1),
+                        'peak_speed': round(sprint_peak_speed, 2),
+                        'duration': round(duration, 1),
+                        'lat': s_gps[0] if s_gps else None,
+                        'lon': s_gps[1] if s_gps else None,
+                    })
+                sprint_active = False
+            else:
+                if power is not None and power > sprint_peak_power:
+                    sprint_peak_power = power
+                if speed is not None and speed > sprint_peak_speed:
+                    sprint_peak_speed = speed
+                sprint_last_ts = ts
+        elif is_sprint_trigger:
+            sprint_active = True
+            sprint_start_ts = ts
+            sprint_start_idx = i
+            sprint_peak_power = power if power else 0
+            sprint_peak_speed = speed if speed else 0
+            sprint_last_ts = ts
+
+        # Climb state machine
+        if alt is not None and prev_ts is not None:
+            dt = ts - prev_ts
+            if climb_active:
+                if dt > 0 and climb_last_alt is not None:
+                    alt_delta = alt - climb_last_alt
+                    if alt_delta > 0:
+                        climb_elevation_gain += alt_delta
+                    # Check gradient over recent segment
+                    # Use distance if available, otherwise estimate
+                    if speed is not None and speed > 0.5 and dt > 0:
+                        h_dist = speed * dt
+                        if h_dist > 0:
+                            gradient = alt_delta / h_dist
+                        else:
+                            gradient = 0
+                    else:
+                        gradient = 0
+
+                    # End climb if gradient drops below threshold
+                    if gradient < -thresholds['climb_gradient'] or (ts - climb_last_ts > 10 and gradient < 0):
+                        duration = climb_last_ts - climb_start_ts
+                        if duration >= thresholds['climb_min_duration'] and climb_elevation_gain >= thresholds['climb_min_elevation_gain']:
+                            c_gps = gps_lookup.get(climb_start_idx)
+                            moments.append({
+                                'type': 'climb',
+                                'timestamp': climb_start_ts,
+                                'value': round(climb_elevation_gain, 1),
+                                'duration': round(duration, 1),
+                                'lat': c_gps[0] if c_gps else None,
+                                'lon': c_gps[1] if c_gps else None,
+                            })
+                        climb_active = False
+                climb_last_alt = alt
+                climb_last_ts = ts
+            else:
+                # Check if climb starts
+                if speed is not None and speed > 0.5 and dt > 0:
+                    h_dist = speed * dt
+                    if h_dist > 0 and climb_last_alt is not None:
+                        gradient = (alt - climb_last_alt) / h_dist
+                        if gradient > thresholds['climb_gradient']:
+                            climb_active = True
+                            climb_start_ts = ts
+                            climb_start_idx = i
+                            climb_start_alt = alt
+                            climb_elevation_gain = 0
+                            climb_last_ts = ts
+                climb_last_alt = alt
+
+        if speed is not None:
+            prev_speed = speed
+        prev_ts = ts
+
+    # Flush active sprint
+    if sprint_active:
+        duration = sprint_last_ts - sprint_start_ts
+        if duration >= thresholds['sprint_min_duration']:
+            s_gps = gps_lookup.get(sprint_start_idx)
+            moments.append({
+                'type': 'sprint',
+                'timestamp': sprint_start_ts,
+                'value': round(sprint_peak_power, 1),
+                'peak_speed': round(sprint_peak_speed, 2),
+                'duration': round(duration, 1),
+                'lat': s_gps[0] if s_gps else None,
+                'lon': s_gps[1] if s_gps else None,
+            })
+
+    # Flush active climb
+    if climb_active:
+        duration = climb_last_ts - climb_start_ts
+        if duration >= thresholds['climb_min_duration'] and climb_elevation_gain >= thresholds['climb_min_elevation_gain']:
+            c_gps = gps_lookup.get(climb_start_idx)
+            moments.append({
+                'type': 'climb',
+                'timestamp': climb_start_ts,
+                'value': round(climb_elevation_gain, 1),
+                'duration': round(duration, 1),
+                'lat': c_gps[0] if c_gps else None,
+                'lon': c_gps[1] if c_gps else None,
+            })
+
+    return moments
+
+
+def detect_achievements(records, session_stats, thresholds):
+    """Detect personal achievements from session data."""
+    achievements = []
+    max_speed = session_stats.get('max_speed')
+    if max_speed is not None and max_speed > thresholds['speed_surge']:
+        achievements.append({
+            'type': 'speed_demon',
+            'value': round(max_speed * 3.6, 1),  # km/h
+        })
+    return achievements
+
+
+def correlate_moments(file_moments, time_window):
+    """Correlate moments across multiple files to find group moments."""
+    # Gather all moments with file_id tag
+    all_by_type = {}
+    for file_id, moments in file_moments.items():
+        for m in moments:
+            t = m['type']
+            if t not in all_by_type:
+                all_by_type[t] = []
+            all_by_type[t].append({**m, 'file_id': file_id})
+
+    group_moments = []
+    for mtype, items in all_by_type.items():
+        items.sort(key=lambda x: x['timestamp'])
+        consumed = set()
+
+        for i, anchor in enumerate(items):
+            if i in consumed:
+                continue
+            members = [anchor]
+            member_files = {anchor['file_id']}
+
+            for j in range(i + 1, len(items)):
+                if j in consumed:
+                    continue
+                candidate = items[j]
+                if candidate['timestamp'] - anchor['timestamp'] > time_window:
+                    break
+                if candidate['file_id'] not in member_files:
+                    members.append(candidate)
+                    member_files.add(candidate['file_id'])
+                    consumed.add(j)
+
+            if len(member_files) >= 2:
+                consumed.add(i)
+                avg_ts = sum(m['timestamp'] for m in members) / len(members)
+                max_val = max(m['value'] for m in members)
+                max_dur = max((m.get('duration') or 0) for m in members)
+                lats = [m['lat'] for m in members if m.get('lat') is not None]
+                lons = [m['lon'] for m in members if m.get('lon') is not None]
+                group_moments.append({
+                    'type': mtype,
+                    'timestamp': round(avg_ts),
+                    'value': max_val,
+                    'duration': round(max_dur, 1) if max_dur > 0 else None,
+                    'lat': round(sum(lats) / len(lats), 6) if lats else None,
+                    'lon': round(sum(lons) / len(lons), 6) if lons else None,
+                    'members': [{
+                        'file_id': m['file_id'],
+                        'value': m['value'],
+                        'timestamp': m['timestamp'],
+                    } for m in members],
+                    'member_count': len(members),
+                })
+
+    group_moments.sort(key=lambda x: -x['member_count'])
+    return group_moments
+
+
+def correlate_achievements(file_achievements):
+    """Correlate achievements across multiple files."""
+    by_type = {}
+    for file_id, achs in file_achievements.items():
+        for a in achs:
+            t = a['type']
+            if t not in by_type:
+                by_type[t] = {}
+            # Keep highest value per file per type
+            if file_id not in by_type[t] or a['value'] > by_type[t][file_id]['value']:
+                by_type[t][file_id] = {**a, 'file_id': file_id}
+
+    group_achievements = []
+    for atype, file_map in by_type.items():
+        if len(file_map) >= 2:
+            members = list(file_map.values())
+            group_achievements.append({
+                'type': atype,
+                'members': members,
+                'member_count': len(members),
+                'max_value': max(m['value'] for m in members),
+            })
+    return group_achievements
+
+
+# ==============================================================================
+# Report Export (self-contained HTML → Print to PDF)
+# ==============================================================================
+
+def _fmt_dur(sec):
+    """Format seconds as H:MM:SS or M:SS."""
+    if not sec:
+        return '\u2014'
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f'{h}:{m:02d}:{s:02d}'
+    return f'{m}:{s:02d}'
+
+
+def _fmt_dist_km(meters):
+    return f'{meters / 1000:.2f}'
+
+
+def _fmt_speed_kmh(ms):
+    return f'{ms * 3.6:.1f}'
+
+
+def _render_gps_svg(gps_points, width=540, height=340):
+    """Render GPS route as an inline SVG element."""
+    if not gps_points or len(gps_points) < 2:
+        return '<div style="color:#94a3b8;text-align:center;padding:40px">No GPS data available</div>'
+
+    # Downsample for SVG
+    pts = gps_points
+    if len(pts) > 500:
+        step = len(pts) / 500
+        pts = [pts[int(i * step)] for i in range(500)]
+        if pts[-1] != gps_points[-1]:
+            pts.append(gps_points[-1])
+
+    lats = [p[0] for p in pts]
+    lons = [p[1] for p in pts]
+    min_lat, max_lat = min(lats), max(lats)
+    min_lon, max_lon = min(lons), max(lons)
+
+    # Padding
+    lat_range = (max_lat - min_lat) or 0.001
+    lon_range = (max_lon - min_lon) or 0.001
+    pad = 0.08
+    min_lat -= lat_range * pad
+    max_lat += lat_range * pad
+    min_lon -= lon_range * pad
+    max_lon += lon_range * pad
+    lat_range = max_lat - min_lat
+    lon_range = max_lon - min_lon
+
+    # Aspect ratio correction
+    cos_lat = math.cos(math.radians((min_lat + max_lat) / 2))
+    effective_lon_range = lon_range * cos_lat
+
+    # Fit into viewbox maintaining aspect
+    if effective_lon_range / lat_range > width / height:
+        view_w = width
+        view_h = int(lat_range / (effective_lon_range / width))
+        if view_h < 100:
+            view_h = 100
+    else:
+        view_h = height
+        view_w = int(effective_lon_range / (lat_range / height))
+        if view_w < 100:
+            view_w = 100
+
+    def project(lat, lon):
+        x = (lon - min_lon) / lon_range * view_w
+        y = (1 - (lat - min_lat) / lat_range) * view_h
+        return f'{x:.1f},{y:.1f}'
+
+    polyline_pts = ' '.join(project(p[0], p[1]) for p in pts)
+    start = project(pts[0][0], pts[0][1])
+    end = project(pts[-1][0], pts[-1][1])
+    sx, sy = start.split(',')
+    ex, ey = end.split(',')
+
+    # Distance scale
+    mid_lat = (min_lat + max_lat) / 2
+    km_per_deg_lon = 111.32 * math.cos(math.radians(mid_lat))
+    map_km = lon_range * km_per_deg_lon
+    scale_km = 1
+    for s in [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]:
+        if s / map_km * view_w > 40:
+            scale_km = s
+            break
+    scale_px = scale_km / map_km * view_w
+
+    svg = f'''<svg viewBox="0 0 {view_w} {view_h}" width="{width}" height="{height}"
+     xmlns="http://www.w3.org/2000/svg" style="background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0">
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="1" stdDeviation="2" flood-opacity="0.15"/>
+    </filter>
+  </defs>
+  <polyline points="{polyline_pts}" fill="none" stroke="#2563eb" stroke-width="2.5"
+    stroke-linecap="round" stroke-linejoin="round" filter="url(#shadow)" opacity="0.85"/>
+  <circle cx="{sx}" cy="{sy}" r="6" fill="#22c55e" stroke="#fff" stroke-width="2"/>
+  <circle cx="{ex}" cy="{ey}" r="6" fill="#ef4444" stroke="#fff" stroke-width="2"/>
+  <g transform="translate(10,{view_h - 15})">
+    <line x1="0" y1="0" x2="{scale_px:.1f}" y2="0" stroke="#64748b" stroke-width="2"/>
+    <line x1="0" y1="-3" x2="0" y2="3" stroke="#64748b" stroke-width="1.5"/>
+    <line x1="{scale_px:.1f}" y1="-3" x2="{scale_px:.1f}" y2="3" stroke="#64748b" stroke-width="1.5"/>
+    <text x="{scale_px / 2:.1f}" y="-5" text-anchor="middle" font-size="9" fill="#64748b">{scale_km} km</text>
+  </g>
+  <g transform="translate({view_w - 22},12)">
+    <text text-anchor="middle" font-size="9" fill="#22c55e" font-weight="600">S</text>
+  </g>
+  <g transform="translate({view_w - 10},12)">
+    <text text-anchor="middle" font-size="9" fill="#ef4444" font-weight="600">F</text>
+  </g>
+</svg>'''
+    return svg
+
+
+def _render_profile_svg(elapsed, values, color, label, unit, width=540, height=150):
+    """Render a timeseries profile as an inline SVG area chart."""
+    if not elapsed or not values or len(values) < 2:
+        return ''
+    n = len(values)
+    min_v = min(v for v in values if v is not None) if any(v is not None for v in values) else 0
+    max_v = max(v for v in values if v is not None) if any(v is not None for v in values) else 1
+    v_range = max_v - min_v or 1
+    max_t = elapsed[-1] if elapsed[-1] > 0 else 1
+    pad_l, pad_r, pad_t, pad_b = 45, 10, 20, 25
+    cw = width - pad_l - pad_r
+    ch = height - pad_t - pad_b
+
+    def px(t, v):
+        x = pad_l + (t / max_t) * cw
+        y = pad_t + (1 - (v - min_v) / v_range) * ch
+        return x, y
+
+    # Build path
+    path_pts = []
+    area_pts = []
+    for i in range(n):
+        v = values[i] if values[i] is not None else min_v
+        t = elapsed[i]
+        x, y = px(t, v)
+        path_pts.append(f'{x:.1f},{y:.1f}')
+        area_pts.append(f'{x:.1f},{y:.1f}')
+
+    # Area fill
+    first_x = pad_l + (elapsed[0] / max_t) * cw
+    last_x = pad_l + (elapsed[-1] / max_t) * cw
+    bottom = pad_t + ch
+    area_d = f'M{first_x:.1f},{bottom} L' + ' L'.join(area_pts) + f' L{last_x:.1f},{bottom} Z'
+    line_d = 'M' + ' L'.join(path_pts)
+
+    # Y axis ticks (5 ticks)
+    y_ticks = ''
+    for i in range(5):
+        v = min_v + (v_range * i / 4)
+        _, y = px(0, v)
+        y_ticks += f'<line x1="{pad_l}" y1="{y:.1f}" x2="{width - pad_r}" y2="{y:.1f}" stroke="#e2e8f0" stroke-width="0.5"/>'
+        y_ticks += f'<text x="{pad_l - 4}" y="{y + 3:.1f}" text-anchor="end" font-size="8" fill="#94a3b8">{v:.0f}</text>'
+
+    # X axis ticks (time)
+    x_ticks = ''
+    for i in range(5):
+        t = max_t * i / 4
+        x = pad_l + (t / max_t) * cw
+        x_ticks += f'<text x="{x:.1f}" y="{height - 5}" text-anchor="middle" font-size="8" fill="#94a3b8">{_fmt_dur(t)}</text>'
+
+    return f'''<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}"
+     xmlns="http://www.w3.org/2000/svg" style="margin-bottom:8px">
+  <text x="{pad_l}" y="13" font-size="10" font-weight="600" fill="#475569">{label} ({unit})</text>
+  {y_ticks}
+  {x_ticks}
+  <path d="{area_d}" fill="{color}" opacity="0.12"/>
+  <path d="{line_d}" fill="none" stroke="{color}" stroke-width="1.5" stroke-linejoin="round"/>
+</svg>'''
+
+
+def _render_zone_bars_svg(zone_data, colors, width=540):
+    """Render zone distribution as horizontal SVG bars."""
+    if not zone_data:
+        return ''
+    labels = zone_data['labels']
+    pcts = zone_data['pct']
+    secs = zone_data['zones']
+    n = len(labels)
+    bar_h = 22
+    gap = 4
+    label_w = 100
+    time_w = 60
+    bar_w = width - label_w - time_w - 20
+    total_h = n * (bar_h + gap) + 4
+
+    bars = ''
+    for i in range(n):
+        y = i * (bar_h + gap)
+        fill_w = max(pcts[i] / 100 * bar_w, 2)
+        bars += f'''<text x="{label_w - 4}" y="{y + 15}" text-anchor="end" font-size="9" fill="#64748b">{labels[i]}</text>
+  <rect x="{label_w}" y="{y}" width="{bar_w}" height="{bar_h}" rx="3" fill="#f1f5f9"/>
+  <rect x="{label_w}" y="{y}" width="{fill_w:.1f}" height="{bar_h}" rx="3" fill="{colors[i]}"/>
+  <text x="{label_w + fill_w - 4}" y="{y + 15}" text-anchor="end" font-size="8" fill="#fff" font-weight="600">{pcts[i]}%</text>
+  <text x="{label_w + bar_w + 6}" y="{y + 15}" font-size="9" fill="#94a3b8" font-family="monospace">{_fmt_dur(secs[i])}</text>'''
+
+    return f'''<svg viewBox="0 0 {width} {total_h}" width="{width}" height="{total_h}"
+     xmlns="http://www.w3.org/2000/svg">{bars}</svg>'''
+
+
+def _build_report_data(file_id, thresholds=None):
+    """Assemble all data needed for a single-file report."""
+    entry = uploaded_files[file_id]
+    stats = entry.get('session_stats', {})
+    records = entry.get('records', [])
+    gps_points = entry.get('gps_points', [])
+    laps = entry.get('laps', [])
+    timeseries = _build_timeseries(records, gps_points, max_points=500)
+    zones = _compute_zones(records, gps_points)
+    if thresholds is None:
+        thresholds = {
+            'speed_surge': DEFAULT_SPEED_SURGE_THRESHOLD,
+            'power_spike': DEFAULT_POWER_SPIKE_THRESHOLD,
+            'sprint_power': DEFAULT_SPRINT_POWER_THRESHOLD,
+            'sprint_accel': DEFAULT_SPRINT_ACCEL_THRESHOLD,
+            'sprint_min_duration': DEFAULT_SPRINT_MIN_DURATION,
+            'climb_gradient': DEFAULT_CLIMB_GRADIENT_THRESHOLD,
+            'climb_min_duration': DEFAULT_CLIMB_MIN_DURATION,
+            'climb_min_elevation_gain': DEFAULT_CLIMB_MIN_ELEVATION_GAIN,
+        }
+    moments = detect_moments(records, gps_points, thresholds)
+    achievements = detect_achievements(records, stats, thresholds)
+    return {
+        'file_id': file_id,
+        'filename': entry['filename'],
+        'original_start': entry.get('original_start'),
+        'stats': stats,
+        'gps_points': gps_points,
+        'laps': laps,
+        'timeseries': timeseries,
+        'zones': zones,
+        'moments': moments,
+        'achievements': achievements,
+    }
+
+
+def _generate_report_html(data, auto_print=True):
+    """Generate a self-contained HTML report for a single file."""
+    filename = data['filename'].replace('.fit', '').replace('.FIT', '')
+    start = data.get('original_start') or 'Unknown'
+    stats = data['stats']
+    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+    # Stats grid
+    stat_items = []
+    def add_stat(label, val, unit=''):
+        if val is not None:
+            stat_items.append((label, val, unit))
+
+    if stats.get('total_distance') is not None:
+        add_stat('Distance', _fmt_dist_km(stats['total_distance']), 'km')
+    if stats.get('total_timer_time') is not None:
+        add_stat('Duration', _fmt_dur(stats['total_timer_time']))
+    if stats.get('avg_speed') is not None:
+        add_stat('Avg Speed', _fmt_speed_kmh(stats['avg_speed']), 'km/h')
+    if stats.get('max_speed') is not None:
+        add_stat('Max Speed', _fmt_speed_kmh(stats['max_speed']), 'km/h')
+    if stats.get('total_ascent') is not None:
+        add_stat('Ascent', str(stats['total_ascent']), 'm')
+    if stats.get('total_descent') is not None:
+        add_stat('Descent', str(stats['total_descent']), 'm')
+    if stats.get('avg_heart_rate') is not None:
+        add_stat('Avg HR', str(stats['avg_heart_rate']), 'bpm')
+    if stats.get('max_heart_rate') is not None:
+        add_stat('Max HR', str(stats['max_heart_rate']), 'bpm')
+    if stats.get('avg_power') is not None:
+        add_stat('Avg Power', str(stats['avg_power']), 'W')
+    if stats.get('max_power') is not None:
+        add_stat('Max Power', str(stats['max_power']), 'W')
+    if stats.get('normalized_power') is not None:
+        add_stat('NP', str(stats['normalized_power']), 'W')
+    if stats.get('total_calories') is not None:
+        add_stat('Calories', str(stats['total_calories']), 'kcal')
+    if stats.get('avg_cadence') is not None:
+        add_stat('Avg Cadence', str(stats['avg_cadence']), 'rpm')
+    if stats.get('avg_temperature') is not None:
+        add_stat('Avg Temp', str(stats['avg_temperature']), '\u00b0C')
+
+    stats_html = ''
+    for label, val, unit in stat_items:
+        stats_html += f'<div class="stat-box"><div class="stat-val">{val}<span class="stat-unit">{unit}</span></div><div class="stat-lbl">{label}</div></div>'
+
+    # Route SVG
+    route_svg = _render_gps_svg(data['gps_points'])
+
+    # Profile charts
+    ts = data['timeseries']
+    profiles_html = ''
+    if ts.get('elevation'):
+        elev_vals = ts['elevation']
+        profiles_html += _render_profile_svg(ts.get('elapsed', []), elev_vals, '#64748b', 'Elevation', 'm')
+    if ts.get('speed'):
+        speed_vals = [v * 3.6 for v in ts['speed']]
+        profiles_html += _render_profile_svg(ts.get('elapsed', []), speed_vals, '#2563eb', 'Speed', 'km/h')
+    if ts.get('heart_rate'):
+        profiles_html += _render_profile_svg(ts.get('elapsed', []), ts['heart_rate'], '#dc2626', 'Heart Rate', 'bpm')
+    if ts.get('power'):
+        profiles_html += _render_profile_svg(ts.get('elapsed', []), ts['power'], '#ea580c', 'Power', 'W')
+
+    # Laps table
+    laps_html = ''
+    laps = data.get('laps', [])
+    if laps:
+        laps_html = '<div class="section"><div class="section-title">Lap Splits</div><table class="lap-tbl"><thead><tr><th>#</th>'
+        col_defs = [
+            ('total_timer_time', 'Duration', lambda v: _fmt_dur(v)),
+            ('total_distance', 'Distance', lambda v: _fmt_dist_km(v) + ' km'),
+            ('avg_speed', 'Avg Speed', lambda v: _fmt_speed_kmh(v) + ' km/h'),
+            ('avg_heart_rate', 'Avg HR', lambda v: f'{v} bpm'),
+            ('max_heart_rate', 'Max HR', lambda v: f'{v} bpm'),
+            ('avg_power', 'Avg Power', lambda v: f'{v} W'),
+            ('avg_cadence', 'Cadence', lambda v: f'{v} rpm'),
+            ('total_ascent', 'Ascent', lambda v: f'{v} m'),
+        ]
+        active_cols = [(k, l, f) for k, l, f in col_defs if any(lap.get(k) is not None for lap in laps)]
+        for _, label, _ in active_cols:
+            laps_html += f'<th>{label}</th>'
+        laps_html += '</tr></thead><tbody>'
+        for i, lap in enumerate(laps):
+            laps_html += f'<tr><td>{i + 1}</td>'
+            for key, _, fmt in active_cols:
+                v = lap.get(key)
+                laps_html += f'<td>{fmt(v) if v is not None else chr(8212)}</td>'
+            laps_html += '</tr>'
+        laps_html += '</tbody></table></div>'
+
+    # Zones
+    zones_html = ''
+    zones = data.get('zones', {})
+    hr_colors = ['#3b82f6', '#22c55e', '#eab308', '#f97316', '#ef4444']
+    pw_colors = ['#93c5fd', '#60a5fa', '#3b82f6', '#2563eb', '#1d4ed8', '#1e3a8a']
+    if zones.get('hr') or zones.get('power'):
+        zones_html = '<div class="section"><div class="section-title">Zone Analysis</div>'
+        if zones.get('hr'):
+            zones_html += f'<div class="zone-heading">Heart Rate Zones (Max HR: {zones["hr"]["max_hr"]} bpm)</div>'
+            zones_html += _render_zone_bars_svg(zones['hr'], hr_colors)
+        if zones.get('power'):
+            zones_html += f'<div class="zone-heading" style="margin-top:16px">Power Zones (FTP: {zones["power"]["ftp"]} W)</div>'
+            zones_html += _render_zone_bars_svg(zones['power'], pw_colors)
+        zones_html += '</div>'
+
+    # Moments
+    moments_html = ''
+    moments = data.get('moments', [])
+    achievements = data.get('achievements', [])
+    moment_labels = {'speed_surge': 'Speed Surge', 'power_spike': 'Power Spike', 'sprint': 'Sprint', 'climb': 'Climb'}
+    moment_colors = {'speed_surge': '#e6198a', 'power_spike': '#d97706', 'sprint': '#dc2626', 'climb': '#15803d'}
+    if moments or achievements:
+        by_type = {}
+        for m in moments:
+            by_type.setdefault(m['type'], []).append(m)
+        moments_html = '<div class="section"><div class="section-title">Detected Moments</div><div class="moment-badges-r">'
+        for mtype, items in by_type.items():
+            c = moment_colors.get(mtype, '#666')
+            moments_html += f'<span class="mbadge" style="background:{c}15;color:{c};border:1px solid {c}40">{len(items)} {moment_labels.get(mtype, mtype)}</span>'
+        for a in achievements:
+            moments_html += f'<span class="mbadge" style="background:#fef3c7;color:#92400e;border:1px solid #fde68a">\U0001f3c6 {a["value"]} km/h</span>'
+        moments_html += '</div>'
+
+        for mtype, items in by_type.items():
+            c = moment_colors.get(mtype, '#666')
+            moments_html += f'<div class="moment-group"><div class="moment-group-title" style="color:{c}">{moment_labels.get(mtype, mtype)} ({len(items)})</div>'
+            for m in items[:10]:  # Cap display
+                detail = ''
+                if mtype == 'speed_surge':
+                    detail = f'{m["value"] * 3.6:.1f} km/h'
+                elif mtype == 'power_spike':
+                    detail = f'{m["value"]:.0f} W'
+                elif mtype == 'sprint':
+                    detail = f'{m["value"]:.0f} W peak, {m["duration"]}s'
+                elif mtype == 'climb':
+                    detail = f'+{m["value"]} m, {_fmt_dur(m.get("duration", 0))}'
+                moments_html += f'<div class="moment-row"><span>{detail}</span></div>'
+            if len(items) > 10:
+                moments_html += f'<div class="moment-row" style="color:#94a3b8">+{len(items) - 10} more</div>'
+            moments_html += '</div>'
+        moments_html += '</div>'
+
+    print_script = '<script>window.onload=function(){window.print()}</script>' if auto_print else ''
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Activity Report \u2014 {filename}</title>
+<style>
+  @page {{ size: A4; margin: 12mm 15mm; }}
+  @media print {{
+    body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    .no-print {{ display: none !important; }}
+    .page-break {{ page-break-before: always; }}
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    color: #1e293b; background: #fff; font-size: 13px; line-height: 1.5;
+  }}
+  .page {{ max-width: 680px; margin: 0 auto; padding: 20px; }}
+  /* Header */
+  .header {{
+    background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 60%, #3b82f6 100%);
+    color: white; padding: 28px 32px; border-radius: 12px; margin-bottom: 24px;
+    position: relative; overflow: hidden;
+  }}
+  .header::after {{
+    content: ''; position: absolute; top: -50%; right: -20%; width: 300px; height: 300px;
+    background: radial-gradient(circle, rgba(255,255,255,0.08) 0%, transparent 70%);
+    border-radius: 50%;
+  }}
+  .header h1 {{ font-size: 22px; font-weight: 700; margin-bottom: 2px; letter-spacing: -0.02em; }}
+  .header .meta {{ font-size: 12px; opacity: 0.8; }}
+  .header .meta span {{ margin-right: 16px; }}
+  /* Stats */
+  .stats-grid {{
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 24px;
+  }}
+  .stat-box {{
+    background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
+    padding: 12px 10px; text-align: center;
+  }}
+  .stat-val {{ font-size: 18px; font-weight: 700; color: #1e293b; line-height: 1.2; }}
+  .stat-unit {{ font-size: 10px; font-weight: 400; color: #64748b; margin-left: 2px; }}
+  .stat-lbl {{ font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: #94a3b8; margin-top: 2px; }}
+  /* Sections */
+  .section {{
+    margin-bottom: 24px; padding-bottom: 20px; border-bottom: 1px solid #f1f5f9;
+  }}
+  .section:last-child {{ border-bottom: none; }}
+  .section-title {{
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+    color: #64748b; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #e2e8f0;
+  }}
+  /* Route */
+  .route-container {{ text-align: center; margin-bottom: 8px; }}
+  /* Laps */
+  .lap-tbl {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
+  .lap-tbl th {{
+    text-align: left; padding: 6px 8px; font-weight: 600; font-size: 9px;
+    text-transform: uppercase; letter-spacing: 0.04em; color: #64748b;
+    border-bottom: 2px solid #e2e8f0; background: #f8fafc;
+  }}
+  .lap-tbl td {{
+    padding: 6px 8px; border-bottom: 1px solid #f1f5f9;
+    font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px;
+  }}
+  .lap-tbl tr:nth-child(even) td {{ background: #fafbfc; }}
+  /* Zones */
+  .zone-heading {{ font-size: 11px; font-weight: 600; color: #475569; margin-bottom: 8px; }}
+  /* Moments */
+  .moment-badges-r {{ display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }}
+  .mbadge {{
+    display: inline-flex; align-items: center; gap: 3px;
+    padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  }}
+  .moment-group {{ margin-bottom: 10px; }}
+  .moment-group-title {{ font-size: 11px; font-weight: 600; margin-bottom: 4px; }}
+  .moment-row {{
+    font-size: 11px; padding: 2px 8px; border-left: 3px solid #e2e8f0;
+    margin-bottom: 2px; font-family: 'SF Mono', 'Fira Code', monospace;
+  }}
+  /* Footer */
+  .footer {{
+    text-align: center; font-size: 10px; color: #94a3b8;
+    padding: 16px 0; border-top: 1px solid #f1f5f9; margin-top: 12px;
+  }}
+  /* Print button */
+  .print-bar {{
+    position: fixed; top: 0; left: 0; right: 0; background: #1e293b; color: white;
+    padding: 10px 20px; display: flex; justify-content: space-between; align-items: center;
+    z-index: 1000; font-size: 13px;
+  }}
+  .print-bar button {{
+    background: #2563eb; color: white; border: none; padding: 8px 20px;
+    border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer;
+  }}
+  .print-bar button:hover {{ background: #1d4ed8; }}
+  @media print {{ .print-bar {{ display: none; }} .page {{ padding-top: 0; }} }}
+  @media screen {{ .page {{ padding-top: 56px; }} }}
+</style>
+</head>
+<body>
+<div class="print-bar no-print">
+  <span>Activity Report &mdash; {filename}</span>
+  <button onclick="window.print()">Save as PDF</button>
+</div>
+<div class="page">
+  <div class="header">
+    <h1>{filename}</h1>
+    <div class="meta">
+      <span>Start: {start} UTC</span>
+      <span>Report generated: {now_str}</span>
+    </div>
+  </div>
+
+  <div class="stats-grid">{stats_html}</div>
+
+  <div class="section">
+    <div class="section-title">Route</div>
+    <div class="route-container">{route_svg}</div>
+  </div>
+
+  {('<div class="section"><div class="section-title">Performance Profiles</div>' + profiles_html + '</div>') if profiles_html else ''}
+
+  {laps_html}
+
+  {zones_html}
+
+  {moments_html}
+
+  <div class="footer">
+    Generated by FIT Toolkit &bull; {now_str}
+  </div>
+</div>
+{print_script}
+</body>
+</html>'''
+
+
+def _generate_group_report_html(reports, auto_print=True):
+    """Generate a self-contained HTML report for multiple files."""
+    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    n = len(reports)
+
+    # File list
+    file_list_html = ''
+    for r in reports:
+        fname = r['filename'].replace('.fit', '').replace('.FIT', '')
+        start = r.get('original_start') or 'Unknown'
+        dist = _fmt_dist_km(r['stats']['total_distance']) + ' km' if r['stats'].get('total_distance') else ''
+        dur = _fmt_dur(r['stats'].get('total_timer_time'))
+        file_list_html += f'<div class="file-entry"><strong>{fname}</strong><span class="file-detail">{start} UTC &bull; {dist} &bull; {dur}</span></div>'
+
+    # Comparison table
+    comp_html = '<table class="lap-tbl"><thead><tr><th>Metric</th>'
+    for r in reports:
+        comp_html += f'<th>{r["filename"].replace(".fit", "").replace(".FIT", "")}</th>'
+    comp_html += '</tr></thead><tbody>'
+    metrics = [
+        ('Distance', lambda s: _fmt_dist_km(s['total_distance']) + ' km' if s.get('total_distance') else '\u2014'),
+        ('Duration', lambda s: _fmt_dur(s.get('total_timer_time'))),
+        ('Avg Speed', lambda s: _fmt_speed_kmh(s['avg_speed']) + ' km/h' if s.get('avg_speed') else '\u2014'),
+        ('Max Speed', lambda s: _fmt_speed_kmh(s['max_speed']) + ' km/h' if s.get('max_speed') else '\u2014'),
+        ('Ascent', lambda s: f'{s["total_ascent"]} m' if s.get('total_ascent') else '\u2014'),
+        ('Avg HR', lambda s: f'{s["avg_heart_rate"]} bpm' if s.get('avg_heart_rate') else '\u2014'),
+        ('Max HR', lambda s: f'{s["max_heart_rate"]} bpm' if s.get('max_heart_rate') else '\u2014'),
+        ('Avg Power', lambda s: f'{s["avg_power"]} W' if s.get('avg_power') else '\u2014'),
+        ('Calories', lambda s: f'{s["total_calories"]} kcal' if s.get('total_calories') else '\u2014'),
+    ]
+    for label, fn in metrics:
+        vals = [fn(r['stats']) for r in reports]
+        if all(v == '\u2014' for v in vals):
+            continue
+        comp_html += f'<tr><td style="font-weight:600">{label}</td>'
+        for v in vals:
+            comp_html += f'<td>{v}</td>'
+        comp_html += '</tr>'
+    comp_html += '</tbody></table>'
+
+    # Combined route SVG
+    combined_route = ''
+    overlay_colors = ['#2563eb', '#dc2626', '#16a34a', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316']
+    all_gps = []
+    for r in reports:
+        all_gps.extend(r.get('gps_points', []))
+    if len(all_gps) >= 2:
+        # Compute global bounds
+        all_lats = [p[0] for p in all_gps]
+        all_lons = [p[1] for p in all_gps]
+        min_lat, max_lat = min(all_lats), max(all_lats)
+        min_lon, max_lon = min(all_lons), max(all_lons)
+        lat_range = (max_lat - min_lat) or 0.001
+        lon_range = (max_lon - min_lon) or 0.001
+        pad = 0.08
+        min_lat -= lat_range * pad
+        max_lat += lat_range * pad
+        min_lon -= lon_range * pad
+        max_lon += lon_range * pad
+        lat_range = max_lat - min_lat
+        lon_range = max_lon - min_lon
+        cos_lat = math.cos(math.radians((min_lat + max_lat) / 2))
+        w, h = 540, 340
+        effective_lon_range = lon_range * cos_lat
+        if effective_lon_range / lat_range > w / h:
+            vw = w
+            vh = max(int(lat_range / (effective_lon_range / w)), 100)
+        else:
+            vh = h
+            vw = max(int(effective_lon_range / (lat_range / h)), 100)
+
+        def proj(lat, lon):
+            x = (lon - min_lon) / lon_range * vw
+            y = (1 - (lat - min_lat) / lat_range) * vh
+            return f'{x:.1f},{y:.1f}'
+
+        polylines = ''
+        legend_items = ''
+        for i, r in enumerate(reports):
+            pts = r.get('gps_points', [])
+            if len(pts) < 2:
+                continue
+            if len(pts) > 500:
+                step = len(pts) / 500
+                pts = [pts[int(j * step)] for j in range(500)]
+            color = overlay_colors[i % len(overlay_colors)]
+            pts_str = ' '.join(proj(p[0], p[1]) for p in pts)
+            polylines += f'<polyline points="{pts_str}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.8"/>'
+            fname = r['filename'].replace('.fit', '').replace('.FIT', '')
+            legend_items += f'<span style="display:inline-flex;align-items:center;gap:4px;margin-right:14px"><span style="width:12px;height:3px;background:{color};border-radius:2px;display:inline-block"></span>{fname}</span>'
+
+        combined_route = f'''<div class="section">
+  <div class="section-title">Routes</div>
+  <div class="route-container">
+    <svg viewBox="0 0 {vw} {vh}" width="540" height="{int(540 * vh / vw)}"
+      xmlns="http://www.w3.org/2000/svg" style="background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0">
+      {polylines}
+    </svg>
+  </div>
+  <div style="font-size:10px;color:#64748b;margin-top:6px;text-align:center">{legend_items}</div>
+</div>'''
+
+    # Group moments
+    file_moments = {}
+    file_achievements = {}
+    for r in reports:
+        fid = r['file_id']
+        file_moments[fid] = r.get('moments', [])
+        file_achievements[fid] = r.get('achievements', [])
+    group_moms = correlate_moments(file_moments, DEFAULT_GROUP_TIME_WINDOW)
+    group_achs = correlate_achievements(file_achievements)
+
+    group_html = ''
+    moment_labels = {'speed_surge': 'Speed Surge', 'power_spike': 'Power Spike', 'sprint': 'Sprint', 'climb': 'Climb', 'speed_demon': 'Speed Demon'}
+    moment_colors_map = {'speed_surge': '#e6198a', 'power_spike': '#d97706', 'sprint': '#dc2626', 'climb': '#15803d'}
+    if group_moms or group_achs:
+        group_html = '<div class="section"><div class="section-title">Group Moments</div>'
+        for gm in group_moms:
+            c = moment_colors_map.get(gm['type'], '#666')
+            val_str = ''
+            if gm['type'] == 'speed_surge':
+                val_str = f'{gm["value"] * 3.6:.1f} km/h'
+            elif gm['type'] in ('power_spike', 'sprint'):
+                val_str = f'{gm["value"]:.0f} W'
+            elif gm['type'] == 'climb':
+                val_str = f'+{gm["value"]} m'
+            members_str = ', '.join(
+                (next((r['filename'].replace('.fit','').replace('.FIT','') for r in reports if r['file_id'] == mem['file_id']), mem['file_id']))
+                for mem in gm['members']
+            )
+            group_html += f'<div style="padding:8px;background:#f8fafc;border-radius:6px;margin-bottom:6px;border-left:3px solid {c}">'
+            group_html += f'<div style="font-weight:600;font-size:12px">{moment_labels.get(gm["type"], gm["type"])} &bull; {gm["member_count"]} riders &bull; peak {val_str}</div>'
+            group_html += f'<div style="font-size:10px;color:#64748b">{members_str}</div></div>'
+        if group_achs:
+            for ga in group_achs:
+                group_html += f'<div style="padding:8px;background:#fef3c7;border-radius:6px;margin-bottom:6px">'
+                group_html += f'<div style="font-weight:600;font-size:12px">\U0001f3c6 {moment_labels.get(ga["type"], ga["type"])} &bull; {ga["member_count"]} riders</div></div>'
+        group_html += '</div>'
+
+    print_script = '<script>window.onload=function(){window.print()}</script>' if auto_print else ''
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Group Activity Report</title>
+<style>
+  @page {{ size: A4; margin: 12mm 15mm; }}
+  @media print {{
+    body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    .no-print {{ display: none !important; }}
+    .page-break {{ page-break-before: always; }}
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: #1e293b; background: #fff; font-size: 13px; line-height: 1.5;
+  }}
+  .page {{ max-width: 680px; margin: 0 auto; padding: 20px; }}
+  .header {{
+    background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 60%, #3b82f6 100%);
+    color: white; padding: 28px 32px; border-radius: 12px; margin-bottom: 24px;
+    position: relative; overflow: hidden;
+  }}
+  .header::after {{
+    content: ''; position: absolute; top: -50%; right: -20%; width: 300px; height: 300px;
+    background: radial-gradient(circle, rgba(255,255,255,0.08) 0%, transparent 70%);
+    border-radius: 50%;
+  }}
+  .header h1 {{ font-size: 22px; font-weight: 700; margin-bottom: 2px; }}
+  .header .meta {{ font-size: 12px; opacity: 0.8; }}
+  .section {{ margin-bottom: 24px; padding-bottom: 20px; border-bottom: 1px solid #f1f5f9; }}
+  .section:last-child {{ border-bottom: none; }}
+  .section-title {{
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+    color: #64748b; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #e2e8f0;
+  }}
+  .file-entry {{
+    padding: 8px 12px; background: #f8fafc; border-radius: 6px;
+    margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;
+  }}
+  .file-detail {{ font-size: 11px; color: #64748b; }}
+  .lap-tbl {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
+  .lap-tbl th {{
+    text-align: left; padding: 6px 8px; font-weight: 600; font-size: 9px;
+    text-transform: uppercase; letter-spacing: 0.04em; color: #64748b;
+    border-bottom: 2px solid #e2e8f0; background: #f8fafc;
+  }}
+  .lap-tbl td {{
+    padding: 6px 8px; border-bottom: 1px solid #f1f5f9;
+    font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px;
+  }}
+  .lap-tbl tr:nth-child(even) td {{ background: #fafbfc; }}
+  .route-container {{ text-align: center; }}
+  .footer {{ text-align: center; font-size: 10px; color: #94a3b8; padding: 16px 0; border-top: 1px solid #f1f5f9; margin-top: 12px; }}
+  .print-bar {{
+    position: fixed; top: 0; left: 0; right: 0; background: #1e293b; color: white;
+    padding: 10px 20px; display: flex; justify-content: space-between; align-items: center;
+    z-index: 1000; font-size: 13px;
+  }}
+  .print-bar button {{
+    background: #2563eb; color: white; border: none; padding: 8px 20px;
+    border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer;
+  }}
+  .print-bar button:hover {{ background: #1d4ed8; }}
+  @media print {{ .print-bar {{ display: none; }} .page {{ padding-top: 0; }} }}
+  @media screen {{ .page {{ padding-top: 56px; }} }}
+</style>
+</head>
+<body>
+<div class="print-bar no-print">
+  <span>Group Activity Report &mdash; {n} files</span>
+  <button onclick="window.print()">Save as PDF</button>
+</div>
+<div class="page">
+  <div class="header">
+    <h1>Group Activity Report</h1>
+    <div class="meta">
+      <span>{n} activities</span>
+      <span>&bull; Generated: {now_str}</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Activities</div>
+    {file_list_html}
+  </div>
+
+  {combined_route}
+
+  <div class="section">
+    <div class="section-title">Comparison</div>
+    {comp_html}
+  </div>
+
+  {group_html}
+
+  <div class="footer">
+    Generated by FIT Toolkit &bull; {now_str}
+  </div>
+</div>
+{print_script}
+</body>
+</html>'''
+
+
+# ==============================================================================
 # Web Server (stdlib only — no Flask, no pip install)
 # ==============================================================================
 
@@ -863,6 +1955,90 @@ class FITHandler(BaseHTTPRequestHandler):
                         zf.writestr(info['filename'], info['bytes'])
             self._send_file(buf.getvalue(), 'adjusted_fit_files.zip', 'application/zip')
 
+        elif path.startswith('/report/'):
+            file_id = path.split('/report/')[1]
+            qs = urllib.parse.parse_qs(parsed.query)
+            auto_print = qs.get('print', ['1'])[0] != '0'
+            if file_id not in uploaded_files:
+                self.send_error(404, 'File not found')
+            else:
+                thresholds = _parse_thresholds(qs)
+                report_data = _build_report_data(file_id, thresholds)
+                html = _generate_report_html(report_data, auto_print=auto_print)
+                body = html.encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        elif path == '/report-group':
+            qs = urllib.parse.parse_qs(parsed.query)
+            ids = qs.get('ids', [])
+            auto_print = qs.get('print', ['1'])[0] != '0'
+            if not ids:
+                self.send_error(400, 'No file IDs')
+            else:
+                thresholds = _parse_thresholds(qs)
+                reports = []
+                for fid in ids:
+                    if fid in uploaded_files:
+                        reports.append(_build_report_data(fid, thresholds))
+                if not reports:
+                    self.send_error(404, 'No valid files')
+                else:
+                    html = _generate_group_report_html(reports, auto_print=auto_print)
+                    body = html.encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+        elif path.startswith('/moments/'):
+            file_id = path.split('/moments/')[1]
+            qs = urllib.parse.parse_qs(parsed.query)
+            if file_id not in uploaded_files:
+                self._send_json({'error': 'File not found'}, 404)
+            else:
+                thresholds = _parse_thresholds(qs)
+                records = uploaded_files[file_id].get('records', [])
+                gps_pts = uploaded_files[file_id].get('gps_points', [])
+                session_stats = uploaded_files[file_id].get('session_stats', {})
+                moments = detect_moments(records, gps_pts, thresholds)
+                achievements = detect_achievements(records, session_stats, thresholds)
+                self._send_json({'moments': moments, 'achievements': achievements})
+
+        elif path == '/group-moments':
+            qs = urllib.parse.parse_qs(parsed.query)
+            ids = qs.get('ids', [])
+            if len(ids) < 2:
+                self._send_json({'error': 'Need at least 2 file IDs'}, 400)
+            else:
+                thresholds = _parse_thresholds(qs)
+                time_window = float(qs.get('time_window', [DEFAULT_GROUP_TIME_WINDOW])[0])
+                file_moments = {}
+                file_achievements = {}
+                individual = {}
+                for fid in ids:
+                    if fid not in uploaded_files:
+                        continue
+                    records = uploaded_files[fid].get('records', [])
+                    gps_pts = uploaded_files[fid].get('gps_points', [])
+                    session_stats = uploaded_files[fid].get('session_stats', {})
+                    moments = detect_moments(records, gps_pts, thresholds)
+                    achievements = detect_achievements(records, session_stats, thresholds)
+                    file_moments[fid] = moments
+                    file_achievements[fid] = achievements
+                    individual[fid] = {'moments': moments, 'achievements': achievements}
+                group_moments = correlate_moments(file_moments, time_window)
+                group_achievements = correlate_achievements(file_achievements)
+                self._send_json({
+                    'group_moments': group_moments,
+                    'group_achievements': group_achievements,
+                    'individual': individual,
+                })
+
         else:
             self.send_error(404)
 
@@ -1100,8 +2276,9 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 50%; margin-right: 4px; vertical-align: middle;
   }
   /* Stats card */
-  #stats-card, #charts-card, #laps-card, #zones-card { display: none; }
-  #stats-card.active, #charts-card.active, #laps-card.active, #zones-card.active { display: block; }
+  #stats-card, #charts-card, #laps-card, #zones-card, #thresholds-card, #moments-card, #group-moments-card { display: none; }
+  #stats-card.active, #charts-card.active, #laps-card.active, #zones-card.active,
+  #thresholds-card.active, #moments-card.active, #group-moments-card.active { display: block; }
   .stats-header {
     display: flex; justify-content: space-between; align-items: center;
     margin-bottom: 12px;
@@ -1195,12 +2372,70 @@ HTML_PAGE = """<!DOCTYPE html>
     box-shadow: 0 0 6px rgba(37,99,235,0.5);
   }
 
+  /* Threshold settings */
+  .threshold-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+  }
+  .threshold-item { display: flex; flex-direction: column; gap: 2px; }
+  .threshold-item label {
+    font-size: 0.73rem; color: var(--text-muted); text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .threshold-item input {
+    width: 100%; padding: 6px 8px; border: 1px solid var(--border);
+    border-radius: 6px; font-size: 0.85rem; text-align: center;
+  }
+  .threshold-item input:focus {
+    outline: none; border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(37,99,235,0.1);
+  }
+  /* Moment badges */
+  .moment-badges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .moment-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 4px 10px; border-radius: 16px; font-size: 0.8rem; font-weight: 600;
+  }
+  .moment-badge.speed_surge { background: #fce7f3; color: #be185d; }
+  .moment-badge.power_spike { background: #fef3c7; color: #b45309; }
+  .moment-badge.sprint { background: #fee2e2; color: #b91c1c; }
+  .moment-badge.climb { background: #dcfce7; color: #166534; }
+  .moment-badge.speed_demon { background: #f3e8ff; color: #7e22ce; }
+  /* Moment list */
+  .moment-type-section { margin-bottom: 12px; }
+  .moment-type-header {
+    font-size: 0.8rem; font-weight: 600; margin-bottom: 6px; cursor: pointer;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .moment-type-header:hover { color: var(--primary); }
+  .moment-list { list-style: none; font-size: 0.8rem; }
+  .moment-list li {
+    padding: 4px 8px; border-left: 3px solid var(--border);
+    margin-bottom: 4px; display: flex; justify-content: space-between;
+    align-items: center; font-family: 'SF Mono', 'Fira Code', monospace;
+  }
+  .moment-list li.speed_surge { border-color: #e6198a; }
+  .moment-list li.power_spike { border-color: #d97706; }
+  .moment-list li.sprint { border-color: #dc2626; }
+  .moment-list li.climb { border-color: #15803d; }
+  /* Group moments */
+  .group-moment-item {
+    background: var(--bg); border-radius: 8px; padding: 12px; margin-bottom: 8px;
+  }
+  .group-moment-header {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+  }
+  .group-moment-members {
+    font-size: 0.78rem; color: var(--text-muted);
+  }
+  .group-moment-members span { margin-right: 12px; }
+
   @media (max-width: 600px) {
     body { padding: 12px; }
     .time-row { flex-direction: column; align-items: flex-start; }
     .time-row label { min-width: auto; }
     #map { height: 300px; }
     .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .threshold-grid { grid-template-columns: repeat(2, 1fr); }
     .chart-container { height: 220px; }
   }
 </style>
@@ -1233,6 +2468,12 @@ HTML_PAGE = """<!DOCTYPE html>
       <span><span class="legend-dot" style="background:#22c55e"></span>Start</span>
       <span><span class="legend-dot" style="background:#ef4444"></span>Finish</span>
     </div>
+    <div class="map-legend" id="momentLegend" style="display:none;margin-top:2px">
+      <span><span class="legend-dot" style="background:#e6198a"></span>Speed Surge</span>
+      <span><span class="legend-dot" style="background:#d97706"></span>Power Spike</span>
+      <span><span class="legend-dot" style="background:#dc2626"></span>Sprint</span>
+      <span><span class="legend-dot" style="background:#15803d"></span>Climb</span>
+    </div>
   </div>
 
   <div class="card similarity-card" id="similarity-card">
@@ -1255,9 +2496,12 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="card" id="stats-card">
     <div class="stats-header">
       <div class="card-title" style="margin-bottom:0">Activity Stats</div>
+      <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn btn-secondary btn-sm" id="reportBtn" onclick="exportReport()" style="display:none">Export Report</button>
       <div class="unit-toggle">
         <button class="active" onclick="setUnits('metric')">Metric</button>
         <button onclick="setUnits('imperial')">Imperial</button>
+      </div>
       </div>
     </div>
     <div class="stats-grid" id="statsGrid"></div>
@@ -1279,6 +2523,64 @@ HTML_PAGE = """<!DOCTYPE html>
       <input type="number" id="zoneFTP" value="200" min="50" max="500" onchange="reloadZones()">
     </div>
     <div id="zoneContent"></div>
+  </div>
+
+  <div class="card" id="thresholds-card">
+    <div class="card-title">Moment Detection Thresholds</div>
+    <div class="threshold-grid">
+      <div class="threshold-item">
+        <label>Speed Surge (km/h)</label>
+        <input type="number" id="thSpeedSurge" value="50" step="1" min="1">
+      </div>
+      <div class="threshold-item">
+        <label>Power Spike (W)</label>
+        <input type="number" id="thPowerSpike" value="400" step="10" min="1">
+      </div>
+      <div class="threshold-item">
+        <label>Sprint Power (W)</label>
+        <input type="number" id="thSprintPower" value="400" step="10" min="1">
+      </div>
+      <div class="threshold-item">
+        <label>Sprint Accel (m/s&sup2;)</label>
+        <input type="number" id="thSprintAccel" value="1.0" step="0.1" min="0.1">
+      </div>
+      <div class="threshold-item">
+        <label>Sprint Min Duration (s)</label>
+        <input type="number" id="thSprintMinDur" value="3" step="1" min="1">
+      </div>
+      <div class="threshold-item">
+        <label>Climb Gradient (%)</label>
+        <input type="number" id="thClimbGradient" value="5" step="0.5" min="0.5">
+      </div>
+      <div class="threshold-item">
+        <label>Climb Min Duration (s)</label>
+        <input type="number" id="thClimbMinDur" value="30" step="5" min="5">
+      </div>
+      <div class="threshold-item">
+        <label>Climb Min Elev Gain (m)</label>
+        <input type="number" id="thClimbMinGain" value="10" step="1" min="1">
+      </div>
+      <div class="threshold-item">
+        <label>Group Time Window (s)</label>
+        <input type="number" id="thTimeWindow" value="60" step="5" min="5">
+      </div>
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn btn-primary btn-sm" onclick="redetectMoments()">Re-Analyze</button>
+    </div>
+  </div>
+
+  <div class="card" id="moments-card">
+    <div class="card-title">Moments &amp; Achievements</div>
+    <div id="momentsContent"></div>
+  </div>
+
+  <div class="card" id="group-moments-card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div class="card-title" style="margin-bottom:0">Group Moments</div>
+      <button class="btn btn-secondary btn-sm" onclick="exportGroupReport()">Export Group Report</button>
+    </div>
+    <div id="groupMomentsContent"></div>
   </div>
 
   <div class="card">
@@ -1440,9 +2742,10 @@ async function uploadFile(file) {
     if (Object.keys(files).length === 1 && d.original_start) {
       document.getElementById('originalTime').textContent = d.original_start + ' UTC';
     }
-    if (d.gps_count > 0) loadRoute(d.id);
+    if (d.gps_count > 0) await loadRoute(d.id);
     if (d.has_stats) loadStats(d.id);
     if (d.has_laps) loadLaps(d.id);
+    loadMoments(d.id);
     updateBtn();
   } catch (e) { log('Upload failed: ' + e.message, 'error'); }
 }
@@ -1450,6 +2753,7 @@ async function uploadFile(file) {
 function removeFile(id) {
   fetch('/remove/' + id, { method: 'DELETE' });
   delete files[id];
+  delete currentMomentsData[id];
   overlayFileIds = overlayFileIds.filter(x => x !== id);
   renderFileList(); updateBtn();
   const keys = Object.keys(files);
@@ -1460,7 +2764,7 @@ function removeFile(id) {
     if (first.gps_count > 0) loadRoute(keys[0]); else hideMap();
     if (first.has_stats) loadStats(keys[0]); else hideStats();
     if (first.has_laps) loadLaps(keys[0]); else hideLaps();
-  } else { hideMap(); hideStats(); hideLaps(); hideZones(); hideSimilarity(); }
+  } else { hideMap(); hideStats(); hideLaps(); hideZones(); hideSimilarity(); hideMoments(); }
   if (overlayFileIds.length > 1) refreshOverlay();
 }
 
@@ -2045,6 +3349,7 @@ async function loadStats(fileId) {
 
     if (currentStats && Object.keys(currentStats).length > 0) {
       document.getElementById('stats-card').classList.add('active');
+      document.getElementById('reportBtn').style.display = 'inline-flex';
       renderStats(currentStats);
       // Update max HR from stats if available
       if (currentStats.max_heart_rate) {
@@ -2070,6 +3375,7 @@ function hideStats() {
   document.getElementById('stats-card').classList.remove('active');
   document.getElementById('charts-card').classList.remove('active');
   document.getElementById('resetZoomBtn').style.display = 'none';
+  document.getElementById('reportBtn').style.display = 'none';
   if (currentChart) { currentChart.destroy(); currentChart = null; }
   currentStats = null;
   currentTimeseries = null;
@@ -2192,6 +3498,268 @@ function renderZones(zones) {
 function hideZones() {
   document.getElementById('zones-card').classList.remove('active');
   document.getElementById('zoneContent').innerHTML = '';
+}
+
+// ---- Moments & Group Analysis ----
+let momentMarkerLayer = null;
+let currentMomentsFileId = null;
+let currentMomentsData = {};  // { fileId: { moments, achievements } }
+
+const MOMENT_ICONS = { speed_surge: '\\ud83c\\udfce\\ufe0f', power_spike: '\\u26a1', sprint: '\\ud83c\\udfc3', climb: '\\u26f0\\ufe0f', speed_demon: '\\ud83c\\udfc6' };
+const MOMENT_COLORS = { speed_surge: '#e6198a', power_spike: '#d97706', sprint: '#dc2626', climb: '#15803d' };
+const MOMENT_LABELS = { speed_surge: 'Speed Surge', power_spike: 'Power Spike', sprint: 'Sprint', climb: 'Climb', speed_demon: 'Speed Demon' };
+
+function getThresholdParams() {
+  const ss = parseFloat(document.getElementById('thSpeedSurge').value) || 50;
+  const pp = parseFloat(document.getElementById('thPowerSpike').value) || 400;
+  const sp = parseFloat(document.getElementById('thSprintPower').value) || 400;
+  const sa = parseFloat(document.getElementById('thSprintAccel').value) || 1.0;
+  const sd = parseFloat(document.getElementById('thSprintMinDur').value) || 3;
+  const cg = parseFloat(document.getElementById('thClimbGradient').value) || 5;
+  const cd = parseFloat(document.getElementById('thClimbMinDur').value) || 30;
+  const ce = parseFloat(document.getElementById('thClimbMinGain').value) || 10;
+  const tw = parseFloat(document.getElementById('thTimeWindow').value) || 60;
+  return 'speed_surge=' + (ss / 3.6) + '&power_spike=' + pp + '&sprint_power=' + sp +
+    '&sprint_accel=' + sa + '&sprint_min_duration=' + sd +
+    '&climb_gradient=' + (cg / 100) + '&climb_min_duration=' + cd +
+    '&climb_min_elevation_gain=' + ce + '&time_window=' + tw;
+}
+
+function fmtGarminTs(ts) {
+  const d = new Date((ts + 631065600) * 1000);
+  return d.toISOString().replace('T', ' ').replace(/\\.\\d+Z/, ' UTC');
+}
+
+async function loadMoments(fileId) {
+  currentMomentsFileId = fileId;
+  document.getElementById('thresholds-card').classList.add('active');
+  try {
+    const r = await fetch('/moments/' + fileId + '?' + getThresholdParams());
+    const d = await r.json();
+    if (d.error) return;
+    currentMomentsData[fileId] = d;
+    renderMoments(d);
+    addMomentMarkers(d.moments);
+    // Check for group moments
+    const fids = Object.keys(files);
+    if (fids.length >= 2) loadGroupMoments();
+  } catch (e) { console.warn('Moments load error:', e); }
+}
+
+function renderMoments(data) {
+  const el = document.getElementById('momentsContent');
+  const moments = data.moments || [];
+  const achievements = data.achievements || [];
+  if (moments.length === 0 && achievements.length === 0) {
+    el.innerHTML = '<div style="color:var(--text-muted);font-size:0.85rem">No moments detected with current thresholds.</div>';
+    document.getElementById('moments-card').classList.add('active');
+    return;
+  }
+
+  // Count by type
+  const counts = {};
+  for (const m of moments) { counts[m.type] = (counts[m.type] || 0) + 1; }
+
+  let html = '<div class="moment-badges">';
+  for (const [type, count] of Object.entries(counts)) {
+    html += '<span class="moment-badge ' + type + '">' + (MOMENT_ICONS[type] || '') + ' ' + count + ' ' + (MOMENT_LABELS[type] || type) + '</span>';
+  }
+  if (achievements.length > 0) {
+    for (const a of achievements) {
+      html += '<span class="moment-badge speed_demon">' + MOMENT_ICONS[a.type] + ' ' + (MOMENT_LABELS[a.type] || a.type) + ': ' + a.value + ' km/h</span>';
+    }
+  }
+  html += '</div>';
+
+  // Group moments by type
+  const byType = {};
+  for (const m of moments) {
+    if (!byType[m.type]) byType[m.type] = [];
+    byType[m.type].push(m);
+  }
+
+  for (const [type, items] of Object.entries(byType)) {
+    html += '<div class="moment-type-section">';
+    html += '<div class="moment-type-header" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\\'none\\'?\\'block\\':\\'none\\'">';
+    html += (MOMENT_ICONS[type] || '') + ' ' + (MOMENT_LABELS[type] || type) + ' (' + items.length + ') \\u25be</div>';
+    html += '<ul class="moment-list" style="display:none">';
+    for (const m of items) {
+      let detail = '';
+      if (type === 'speed_surge') detail = (m.value * 3.6).toFixed(1) + ' km/h';
+      else if (type === 'power_spike') detail = m.value + ' W';
+      else if (type === 'sprint') detail = m.value + ' W peak, ' + m.duration + 's';
+      else if (type === 'climb') detail = '+' + m.value + ' m, ' + fmtDuration(m.duration);
+      html += '<li class="' + type + '"><span>' + detail + '</span><span style="color:var(--text-muted)">' + fmtGarminTs(m.timestamp) + '</span></li>';
+    }
+    html += '</ul></div>';
+  }
+
+  el.innerHTML = html;
+  document.getElementById('moments-card').classList.add('active');
+}
+
+function makeMomentIcon(type, isGroup) {
+  const color = MOMENT_COLORS[type] || '#666';
+  const icon = MOMENT_ICONS[type] || '\\u2022';
+  const size = isGroup ? 32 : 22;
+  const fontSize = isGroup ? 16 : 12;
+  const border = isGroup ? '3px solid #fff' : '2px solid #fff';
+  const shadow = isGroup
+    ? '0 2px 8px rgba(0,0,0,0.35), 0 0 0 2px ' + color + '40'
+    : '0 1px 4px rgba(0,0,0,0.3)';
+  return L.divIcon({
+    className: '',
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+    popupAnchor: [0, -size / 2],
+    html: '<div style="width:' + size + 'px;height:' + size + 'px;border-radius:50%;' +
+      'background:' + color + ';border:' + border + ';box-shadow:' + shadow + ';' +
+      'display:flex;align-items:center;justify-content:center;font-size:' + fontSize + 'px;' +
+      'line-height:1;cursor:pointer">' + icon + '</div>'
+  });
+}
+
+function addMomentMarkers(moments) {
+  if (!map) return;
+  if (!momentMarkerLayer) {
+    momentMarkerLayer = L.layerGroup().addTo(map);
+  }
+  momentMarkerLayer.clearLayers();
+  const hasGeoMoments = moments.some(m => m.lat != null && m.lon != null);
+  document.getElementById('momentLegend').style.display = hasGeoMoments ? 'flex' : 'none';
+  for (const m of moments) {
+    if (m.lat == null || m.lon == null) continue;
+    let detail = '';
+    if (m.type === 'speed_surge') detail = (m.value * 3.6).toFixed(1) + ' km/h';
+    else if (m.type === 'power_spike') detail = m.value + ' W';
+    else if (m.type === 'sprint') detail = m.value + ' W peak, ' + m.duration + 's';
+    else if (m.type === 'climb') detail = '+' + m.value + ' m, ' + fmtDuration(m.duration);
+    L.marker([m.lat, m.lon], { icon: makeMomentIcon(m.type, false) })
+      .bindPopup('<b>' + (MOMENT_ICONS[m.type] || '') + ' ' + (MOMENT_LABELS[m.type] || m.type) + '</b><br>' + detail)
+      .addTo(momentMarkerLayer);
+  }
+}
+
+function addGroupMomentMarkers(groupMoments) {
+  if (!map || !momentMarkerLayer) return;
+  for (const gm of groupMoments) {
+    if (gm.lat == null || gm.lon == null) continue;
+    let detail = gm.member_count + ' riders';
+    if (gm.type === 'speed_surge') detail += ', peak ' + (gm.value * 3.6).toFixed(1) + ' km/h';
+    else if (gm.type === 'power_spike') detail += ', peak ' + gm.value + ' W';
+    else if (gm.type === 'sprint') detail += ', peak ' + gm.value + ' W';
+    else if (gm.type === 'climb') detail += ', +' + gm.value + ' m';
+    L.marker([gm.lat, gm.lon], { icon: makeMomentIcon(gm.type, true) })
+      .bindPopup('<b>' + (MOMENT_ICONS[gm.type] || '') + ' Group ' + (MOMENT_LABELS[gm.type] || gm.type) + '</b><br>' + detail)
+      .addTo(momentMarkerLayer);
+  }
+}
+
+async function loadGroupMoments() {
+  const fids = Object.keys(files);
+  if (fids.length < 2) {
+    document.getElementById('group-moments-card').classList.remove('active');
+    return;
+  }
+  const idsParam = fids.map(id => 'ids=' + id).join('&');
+  try {
+    const r = await fetch('/group-moments?' + idsParam + '&' + getThresholdParams());
+    const d = await r.json();
+    if (d.error) return;
+    renderGroupMoments(d);
+    if (d.group_moments && d.group_moments.length > 0) {
+      addGroupMomentMarkers(d.group_moments);
+    }
+  } catch (e) { console.warn('Group moments error:', e); }
+}
+
+function renderGroupMoments(data) {
+  const el = document.getElementById('groupMomentsContent');
+  const gm = data.group_moments || [];
+  const ga = data.group_achievements || [];
+  if (gm.length === 0 && ga.length === 0) {
+    el.innerHTML = '<div style="color:var(--text-muted);font-size:0.85rem">No group moments found. Riders may not have overlapping events within the time window.</div>';
+    document.getElementById('group-moments-card').classList.add('active');
+    return;
+  }
+
+  let html = '';
+  for (const m of gm) {
+    const icon = MOMENT_ICONS[m.type] || '';
+    const label = MOMENT_LABELS[m.type] || m.type;
+    let valStr = '';
+    if (m.type === 'speed_surge') valStr = (m.value * 3.6).toFixed(1) + ' km/h';
+    else if (m.type === 'power_spike' || m.type === 'sprint') valStr = m.value + ' W';
+    else if (m.type === 'climb') valStr = '+' + m.value + ' m';
+    html += '<div class="group-moment-item">';
+    html += '<div class="group-moment-header">';
+    html += '<span class="moment-badge ' + m.type + '">' + icon + ' ' + label + '</span>';
+    html += '<span style="font-weight:600">' + m.member_count + ' riders</span>';
+    html += '<span style="font-size:0.82rem;color:var(--text-muted)">Peak: ' + valStr + '</span>';
+    if (m.duration) html += '<span style="font-size:0.82rem;color:var(--text-muted)">' + fmtDuration(m.duration) + '</span>';
+    html += '</div>';
+    html += '<div class="group-moment-members">';
+    for (const mem of m.members) {
+      const fname = files[mem.file_id] ? files[mem.file_id].filename : mem.file_id;
+      let memVal = '';
+      if (m.type === 'speed_surge') memVal = (mem.value * 3.6).toFixed(1) + ' km/h';
+      else if (m.type === 'power_spike' || m.type === 'sprint') memVal = mem.value + ' W';
+      else if (m.type === 'climb') memVal = '+' + mem.value + ' m';
+      html += '<span>' + fname.replace(/\\.fit$/i, '') + ': ' + memVal + '</span>';
+    }
+    html += '</div></div>';
+  }
+
+  if (ga.length > 0) {
+    html += '<div style="margin-top:12px"><div style="font-weight:600;font-size:0.85rem;margin-bottom:8px">Group Achievements</div>';
+    for (const a of ga) {
+      html += '<div class="group-moment-item"><div class="group-moment-header">';
+      html += '<span class="moment-badge speed_demon">' + (MOMENT_ICONS[a.type] || '\\ud83c\\udfc6') + ' ' + (MOMENT_LABELS[a.type] || a.type) + '</span>';
+      html += '<span style="font-weight:600">' + a.member_count + ' riders</span>';
+      html += '</div><div class="group-moment-members">';
+      for (const mem of a.members) {
+        const fname = files[mem.file_id] ? files[mem.file_id].filename : mem.file_id;
+        html += '<span>' + fname.replace(/\\.fit$/i, '') + ': ' + mem.value + ' km/h</span>';
+      }
+      html += '</div></div>';
+    }
+    html += '</div>';
+  }
+
+  el.innerHTML = html;
+  document.getElementById('group-moments-card').classList.add('active');
+}
+
+function redetectMoments() {
+  if (momentMarkerLayer) momentMarkerLayer.clearLayers();
+  currentMomentsData = {};
+  const fids = Object.keys(files);
+  if (fids.length === 0) return;
+  // Re-analyze each file
+  const promises = fids.map(fid => loadMoments(fid));
+}
+
+function exportReport() {
+  if (currentFileId) {
+    window.open('/report/' + currentFileId + '?' + getThresholdParams(), '_blank');
+  }
+}
+
+function exportGroupReport() {
+  const fids = Object.keys(files);
+  if (fids.length < 2) return;
+  window.open('/report-group?' + fids.map(id => 'ids=' + id).join('&') + '&' + getThresholdParams(), '_blank');
+}
+
+function hideMoments() {
+  document.getElementById('moments-card').classList.remove('active');
+  document.getElementById('group-moments-card').classList.remove('active');
+  document.getElementById('thresholds-card').classList.remove('active');
+  document.getElementById('momentsContent').innerHTML = '';
+  document.getElementById('groupMomentsContent').innerHTML = '';
+  if (momentMarkerLayer) momentMarkerLayer.clearLayers();
+  document.getElementById('momentLegend').style.display = 'none';
+  currentMomentsData = {};
 }
 </script>
 </body>
