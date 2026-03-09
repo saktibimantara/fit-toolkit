@@ -128,6 +128,7 @@ RECORD_FIELDS = {
     6:   ('speed', 'H', 1000, 0),            # mm/s → m/s
     7:   ('power', 'H', 1, 0),
     13:  ('temperature', 'b', 1, 0),         # sint8
+    73:  ('enhanced_speed', 'I', 1000, 0),   # mm/s → m/s, prefer over field 6
     78:  ('enhanced_altitude', 'I', 5, 500), # prefer over field 2
 }
 
@@ -387,6 +388,8 @@ class FITFile:
         # Prefer enhanced fields
         if 'enhanced_altitude' in rec:
             rec['altitude'] = rec.pop('enhanced_altitude')
+        if 'enhanced_speed' in rec:
+            rec['speed'] = rec.pop('enhanced_speed')
         if rec:
             self.records.append(rec)
 
