@@ -475,6 +475,115 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def _bearing_deg(lat1, lon1, lat2, lon2):
+    """Forward azimuth in degrees (0=N, 90=E, 180=S, 270=W)."""
+    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    x = math.sin(dlon) * math.cos(rlat2)
+    y = math.cos(rlat1) * math.sin(rlat2) - math.sin(rlat1) * math.cos(rlat2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def _describe_route_shape(records, gps_lookup, start_idx, end_idx):
+    """Analyze road shape over a record index range. Returns dict with turn/gradient description."""
+    # Collect GPS points in padded range
+    pad_start = max(0, start_idx - 5)
+    pad_end = min(len(records) - 1, end_idx + 5)
+    pts = []
+    for idx in range(pad_start, pad_end + 1):
+        gps = gps_lookup.get(idx)
+        if gps:
+            pts.append((gps[0], gps[1], idx))
+
+    # Compute total bearing change
+    total_bearing_change = 0.0
+    if len(pts) >= 3:
+        bearings = []
+        for k in range(len(pts) - 1):
+            bearings.append(_bearing_deg(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1]))
+        for k in range(len(bearings) - 1):
+            delta = bearings[k + 1] - bearings[k]
+            # Normalize to -180..+180
+            while delta > 180:
+                delta -= 360
+            while delta < -180:
+                delta += 360
+            total_bearing_change += delta
+
+    abs_turn = abs(total_bearing_change)
+    if abs_turn < 15:
+        turn_label = 'straight road'
+    elif abs_turn < 45:
+        turn_label = 'gentle curve ' + ('right' if total_bearing_change > 0 else 'left')
+    elif abs_turn < 90:
+        turn_label = 'curve ' + ('right' if total_bearing_change > 0 else 'left')
+    elif abs_turn < 135:
+        turn_label = 'sharp turn ' + ('right' if total_bearing_change > 0 else 'left')
+    elif abs_turn < 170:
+        turn_label = 'hairpin ' + ('right' if total_bearing_change > 0 else 'left')
+    else:
+        turn_label = 'U-turn'
+
+    # Compute gradient from altitude
+    gradient_pct = 0.0
+    gradient_desc = 'flat'
+    s_idx = max(0, start_idx)
+    e_idx = min(len(records) - 1, end_idx)
+    start_alt = None
+    end_alt = None
+    for idx in range(s_idx, e_idx + 1):
+        alt = records[idx].get('altitude')
+        if alt is not None:
+            if start_alt is None:
+                start_alt = alt
+            end_alt = alt
+
+    if start_alt is not None and end_alt is not None:
+        # Compute horizontal distance
+        h_dist = 0.0
+        prev_pt = None
+        for idx in range(s_idx, e_idx + 1):
+            gps = gps_lookup.get(idx)
+            if gps and prev_pt:
+                h_dist += _haversine_m(prev_pt[0], prev_pt[1], gps[0], gps[1])
+            if gps:
+                prev_pt = gps
+        if h_dist > 5:
+            gradient_pct = ((end_alt - start_alt) / h_dist) * 100
+            g = gradient_pct
+            if g < -3:
+                gradient_desc = 'downhill'
+            elif g < 1:
+                gradient_desc = 'flat'
+            elif g < 4:
+                gradient_desc = 'slight uphill'
+            elif g < 8:
+                gradient_desc = 'uphill'
+            elif g < 12:
+                gradient_desc = 'steep climb'
+            else:
+                gradient_desc = 'very steep'
+
+    # Compose description
+    gradient_pct = round(gradient_pct, 1)
+    if gradient_desc == 'flat':
+        desc = turn_label + ' on flat road'
+    elif gradient_desc == 'downhill':
+        desc = turn_label + ', ' + gradient_desc + ' ' + str(gradient_pct) + '%'
+    else:
+        desc = turn_label + ' on ' + gradient_desc + ' ' + str(gradient_pct) + '%'
+        if gradient_desc in ('steep climb', 'very steep'):
+            desc = turn_label + ' on ' + gradient_desc + ' ' + str(gradient_pct) + '% climb'
+
+    return {
+        'description': desc,
+        'turn': turn_label,
+        'turn_angle': round(total_bearing_change, 1),
+        'gradient_pct': gradient_pct,
+        'gradient_desc': gradient_desc,
+    }
+
+
 def _discrete_frechet(P, Q, dist_fn, max_pts=500):
     """Compute the discrete Fréchet distance between two polylines.
     P, Q: lists of (lat, lon) tuples.
@@ -648,6 +757,7 @@ def detect_moments(records, gps_points, thresholds):
                 'timestamp': ts,
                 'value': round(speed, 2),
                 'lat': lat, 'lon': lon,
+                'route_shape': _describe_route_shape(records, gps_lookup, i - 5, i + 5),
             })
 
         # Power spike detection
@@ -657,6 +767,7 @@ def detect_moments(records, gps_points, thresholds):
                 'timestamp': ts,
                 'value': round(power, 1),
                 'lat': lat, 'lon': lon,
+                'route_shape': _describe_route_shape(records, gps_lookup, i - 5, i + 5),
             })
 
         # Acceleration calculation
@@ -688,6 +799,7 @@ def detect_moments(records, gps_points, thresholds):
                         'duration': round(duration, 1),
                         'lat': s_gps[0] if s_gps else None,
                         'lon': s_gps[1] if s_gps else None,
+                        'route_shape': _describe_route_shape(records, gps_lookup, sprint_start_idx, i),
                     })
                 sprint_active = False
             else:
@@ -735,6 +847,7 @@ def detect_moments(records, gps_points, thresholds):
                                 'duration': round(duration, 1),
                                 'lat': c_gps[0] if c_gps else None,
                                 'lon': c_gps[1] if c_gps else None,
+                                'route_shape': _describe_route_shape(records, gps_lookup, climb_start_idx, i),
                             })
                         climb_active = False
                 climb_last_alt = alt
@@ -771,6 +884,7 @@ def detect_moments(records, gps_points, thresholds):
                 'duration': round(duration, 1),
                 'lat': s_gps[0] if s_gps else None,
                 'lon': s_gps[1] if s_gps else None,
+                'route_shape': _describe_route_shape(records, gps_lookup, sprint_start_idx, len(records) - 1),
             })
 
     # Flush active climb
@@ -785,20 +899,41 @@ def detect_moments(records, gps_points, thresholds):
                 'duration': round(duration, 1),
                 'lat': c_gps[0] if c_gps else None,
                 'lon': c_gps[1] if c_gps else None,
+                'route_shape': _describe_route_shape(records, gps_lookup, climb_start_idx, len(records) - 1),
             })
 
     return moments
 
 
-def detect_achievements(records, session_stats, thresholds):
+def detect_achievements(records, session_stats, thresholds, gps_points=None):
     """Detect personal achievements from session data."""
     achievements = []
     max_speed = session_stats.get('max_speed')
     if max_speed is not None and max_speed > thresholds['speed_surge']:
-        achievements.append({
+        # Find the record with max speed for timestamp and GPS
+        best_idx = None
+        best_rec = None
+        for i, r in enumerate(records):
+            spd = r.get('speed')
+            if spd is not None and abs(spd - max_speed) < 0.01:
+                best_idx = i
+                best_rec = r
+                break
+        entry = {
             'type': 'speed_demon',
             'value': round(max_speed * 3.6, 1),  # km/h
-        })
+        }
+        if best_rec:
+            if best_rec.get('timestamp') is not None:
+                entry['timestamp'] = best_rec['timestamp']
+            # Find GPS from gps_points using record index
+            if gps_points and best_idx is not None:
+                gps_lookup = {pt[2]: (pt[0], pt[1]) for pt in gps_points}
+                gps = gps_lookup.get(best_idx)
+                if gps:
+                    entry['lat'] = gps[0]
+                    entry['lon'] = gps[1]
+        achievements.append(entry)
     return achievements
 
 
@@ -849,10 +984,12 @@ def correlate_moments(file_moments, time_window):
                     'duration': round(max_dur, 1) if max_dur > 0 else None,
                     'lat': round(sum(lats) / len(lats), 6) if lats else None,
                     'lon': round(sum(lons) / len(lons), 6) if lons else None,
+                    'route_shape': members[0].get('route_shape'),
                     'members': [{
                         'file_id': m['file_id'],
                         'value': m['value'],
                         'timestamp': m['timestamp'],
+                        'route_shape': m.get('route_shape'),
                     } for m in members],
                     'member_count': len(members),
                 })
@@ -1114,7 +1251,7 @@ def _build_report_data(file_id, thresholds=None):
             'climb_min_elevation_gain': DEFAULT_CLIMB_MIN_ELEVATION_GAIN,
         }
     moments = detect_moments(records, gps_points, thresholds)
-    achievements = detect_achievements(records, stats, thresholds)
+    achievements = detect_achievements(records, stats, thresholds, gps_points)
     return {
         'file_id': file_id,
         'filename': entry['filename'],
@@ -2009,7 +2146,7 @@ class FITHandler(BaseHTTPRequestHandler):
                 gps_pts = uploaded_files[file_id].get('gps_points', [])
                 session_stats = uploaded_files[file_id].get('session_stats', {})
                 moments = detect_moments(records, gps_pts, thresholds)
-                achievements = detect_achievements(records, session_stats, thresholds)
+                achievements = detect_achievements(records, session_stats, thresholds, gps_pts)
                 self._send_json({'moments': moments, 'achievements': achievements})
 
         elif path == '/group-moments':
@@ -2030,7 +2167,7 @@ class FITHandler(BaseHTTPRequestHandler):
                     gps_pts = uploaded_files[fid].get('gps_points', [])
                     session_stats = uploaded_files[fid].get('session_stats', {})
                     moments = detect_moments(records, gps_pts, thresholds)
-                    achievements = detect_achievements(records, session_stats, thresholds)
+                    achievements = detect_achievements(records, session_stats, thresholds, gps_pts)
                     file_moments[fid] = moments
                     file_achievements[fid] = achievements
                     individual[fid] = {'moments': moments, 'achievements': achievements}
@@ -2374,19 +2511,57 @@ HTML_PAGE = """<!DOCTYPE html>
     background: var(--primary); border: 2px solid white;
     box-shadow: 0 0 6px rgba(37,99,235,0.5);
   }
+  /* Highlight marker for selected moment */
+  .moment-highlight-ring {
+    border-radius: 50%;
+    border: 3px solid var(--primary);
+    box-shadow: 0 0 0 6px rgba(37,99,235,0.25), 0 0 16px rgba(37,99,235,0.4);
+    animation: moment-pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes moment-pulse {
+    0%, 100% { box-shadow: 0 0 0 6px rgba(37,99,235,0.25), 0 0 16px rgba(37,99,235,0.4); }
+    50% { box-shadow: 0 0 0 12px rgba(37,99,235,0.10), 0 0 24px rgba(37,99,235,0.2); }
+  }
+  .moment-list li { cursor: pointer; }
+  .moment-list li:hover { background: var(--bg); }
+  .moment-list li.moment-active { background: var(--bg); border-left-color: var(--primary) !important; }
+  .group-moment-item { cursor: pointer; transition: box-shadow 0.15s; }
+  .group-moment-item:hover { box-shadow: 0 0 0 2px var(--primary); }
+  .group-moment-item.moment-active { box-shadow: 0 0 0 2px var(--primary); background: color-mix(in srgb, var(--primary) 6%, var(--bg)); }
+  .route-shape-tag {
+    display: inline-block; font-size: 0.72rem; padding: 2px 7px; border-radius: 10px;
+    background: #f0f4ff; color: #3b5998; margin-top: 4px; font-weight: 500;
+  }
+  [data-theme="dark"] .route-shape-tag { background: #1e293b; color: #93c5fd; }
 
   /* Threshold settings */
-  .threshold-grid {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+  .th-subtitle {
+    font-size: 0.84rem; color: var(--text-muted); margin-bottom: 16px; line-height: 1.4;
   }
-  .threshold-item { display: flex; flex-direction: column; gap: 2px; }
+  .th-group { margin-bottom: 16px; }
+  .th-group:last-child { margin-bottom: 0; }
+  .th-group-title {
+    font-size: 0.78rem; font-weight: 600; color: var(--text);
+    margin-bottom: 8px; display: flex; align-items: center; gap: 6px;
+  }
+  .th-group-title .th-icon { font-size: 0.9rem; }
+  .threshold-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+  }
+  .threshold-item {
+    display: flex; flex-direction: column; gap: 3px;
+    background: var(--bg); border-radius: 8px; padding: 10px;
+  }
   .threshold-item label {
-    font-size: 0.73rem; color: var(--text-muted); text-transform: uppercase;
-    letter-spacing: 0.03em;
+    font-size: 0.75rem; font-weight: 600; color: var(--text);
+  }
+  .threshold-item .th-hint {
+    font-size: 0.7rem; color: var(--text-muted); line-height: 1.3;
   }
   .threshold-item input {
     width: 100%; padding: 6px 8px; border: 1px solid var(--border);
     border-radius: 6px; font-size: 0.85rem; text-align: center;
+    margin-top: 2px;
   }
   .threshold-item input:focus {
     outline: none; border-color: var(--primary);
@@ -2431,6 +2606,34 @@ HTML_PAGE = """<!DOCTYPE html>
     font-size: 0.78rem; color: var(--text-muted);
   }
   .group-moment-members span { margin-right: 12px; }
+  .copy-ai-btn {
+    margin-left: auto; background: none; border: 1px solid var(--border); border-radius: 6px;
+    padding: 2px 8px; font-size: 0.75rem; color: var(--text-muted); cursor: pointer;
+    position: relative; display: inline-flex; align-items: center; gap: 4px;
+  }
+  .copy-ai-btn:hover { background: var(--bg); color: var(--text); }
+  .copy-ai-menu {
+    display: none; position: absolute; top: 100%; right: 0; margin-top: 4px;
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 100; min-width: 140px; overflow: hidden;
+  }
+  .copy-ai-menu.show { display: block; }
+  .copy-ai-menu div {
+    padding: 8px 12px; font-size: 0.8rem; cursor: pointer; white-space: nowrap;
+  }
+  .copy-ai-menu div:hover { background: var(--bg); }
+  .copy-toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #333; color: #fff; padding: 8px 20px; border-radius: 8px;
+    font-size: 0.85rem; z-index: 9999; animation: toastFade 2.2s forwards;
+  }
+  @keyframes toastFade { 0%,70% { opacity: 1; } 100% { opacity: 0; } }
+  .moment-copy-btn {
+    background: none; border: 1px solid var(--border); cursor: pointer; color: var(--text-muted);
+    font-size: 0.8rem; padding: 1px 6px; margin-left: 4px; border-radius: 4px; position: relative;
+  }
+  .moment-copy-btn:hover { color: var(--text); background: var(--bg); }
+  .moment-list li { overflow: visible; }
 
   @media (max-width: 600px) {
     body { padding: 12px; }
@@ -2438,7 +2641,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .time-row label { min-width: auto; }
     #map { height: 300px; }
     .stats-grid { grid-template-columns: repeat(2, 1fr); }
-    .threshold-grid { grid-template-columns: repeat(2, 1fr); }
+    .threshold-grid { grid-template-columns: 1fr 1fr; }
     .chart-container { height: 220px; }
   }
 </style>
@@ -2529,52 +2732,100 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="card" id="thresholds-card">
-    <div class="card-title">Moment Detection Thresholds</div>
-    <div class="threshold-grid">
-      <div class="threshold-item">
-        <label>Speed Surge (km/h)</label>
-        <input type="number" id="thSpeedSurge" value="50" step="1" min="1">
-      </div>
-      <div class="threshold-item">
-        <label>Power Spike (W)</label>
-        <input type="number" id="thPowerSpike" value="400" step="10" min="1">
-      </div>
-      <div class="threshold-item">
-        <label>Sprint Power (W)</label>
-        <input type="number" id="thSprintPower" value="400" step="10" min="1">
-      </div>
-      <div class="threshold-item">
-        <label>Sprint Accel (m/s&sup2;)</label>
-        <input type="number" id="thSprintAccel" value="1.0" step="0.1" min="0.1">
-      </div>
-      <div class="threshold-item">
-        <label>Sprint Min Duration (s)</label>
-        <input type="number" id="thSprintMinDur" value="3" step="1" min="1">
-      </div>
-      <div class="threshold-item">
-        <label>Climb Gradient (%)</label>
-        <input type="number" id="thClimbGradient" value="5" step="0.5" min="0.5">
-      </div>
-      <div class="threshold-item">
-        <label>Climb Min Duration (s)</label>
-        <input type="number" id="thClimbMinDur" value="30" step="5" min="5">
-      </div>
-      <div class="threshold-item">
-        <label>Climb Min Elev Gain (m)</label>
-        <input type="number" id="thClimbMinGain" value="10" step="1" min="1">
-      </div>
-      <div class="threshold-item">
-        <label>Group Time Window (s)</label>
-        <input type="number" id="thTimeWindow" value="60" step="5" min="5">
+    <div class="card-title">Moment Detection Settings</div>
+    <div class="th-subtitle">Configure how key moments are detected from your ride data. Lower thresholds will detect more events, higher thresholds only flag the most extreme efforts.</div>
+
+    <div class="th-group">
+      <div class="th-group-title"><span class="th-icon">&#x1F3CE;&#xFE0F;</span> Speed &amp; Power Thresholds</div>
+      <div class="threshold-grid">
+        <div class="threshold-item">
+          <label>Speed Surge</label>
+          <div class="th-hint">Minimum instantaneous speed to flag as a notable high-speed moment. Typical: 45&ndash;55 km/h for road cycling.</div>
+          <input type="number" id="thSpeedSurge" value="50" step="1" min="1">
+          <div class="th-hint" style="text-align:center;margin-top:1px">km/h</div>
+        </div>
+        <div class="threshold-item">
+          <label>Power Spike</label>
+          <div class="th-hint">Minimum wattage for a single-second power spike. Set higher for stronger riders. Typical: 350&ndash;500 W.</div>
+          <input type="number" id="thPowerSpike" value="400" step="10" min="1">
+          <div class="th-hint" style="text-align:center;margin-top:1px">watts</div>
+        </div>
       </div>
     </div>
+
+    <div class="th-group">
+      <div class="th-group-title"><span class="th-icon">&#x1F3C3;</span> Sprint Detection</div>
+      <div class="threshold-grid">
+        <div class="threshold-item">
+          <label>Sprint Power</label>
+          <div class="th-hint">Power output that triggers sprint detection. A sprint starts when power, acceleration, or speed exceeds its threshold.</div>
+          <input type="number" id="thSprintPower" value="400" step="10" min="1">
+          <div class="th-hint" style="text-align:center;margin-top:1px">watts</div>
+        </div>
+        <div class="threshold-item">
+          <label>Sprint Acceleration</label>
+          <div class="th-hint">Rate of speed increase that can trigger a sprint. Higher values require sharper accelerations. Typical: 0.8&ndash;1.5 m/s&sup2;.</div>
+          <input type="number" id="thSprintAccel" value="1.0" step="0.1" min="0.1">
+          <div class="th-hint" style="text-align:center;margin-top:1px">m/s&sup2;</div>
+        </div>
+        <div class="threshold-item">
+          <label>Minimum Duration</label>
+          <div class="th-hint">Shortest effort that counts as a sprint. Filters out brief surges that aren&rsquo;t true sprints.</div>
+          <input type="number" id="thSprintMinDur" value="3" step="1" min="1">
+          <div class="th-hint" style="text-align:center;margin-top:1px">seconds</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="th-group">
+      <div class="th-group-title"><span class="th-icon">&#x26F0;&#xFE0F;</span> Climb Detection</div>
+      <div class="threshold-grid">
+        <div class="threshold-item">
+          <label>Gradient</label>
+          <div class="th-hint">Minimum road steepness to count as climbing. 5% is a moderate hill, 8%+ is steep. Lower to catch gentle slopes.</div>
+          <input type="number" id="thClimbGradient" value="5" step="0.5" min="0.5">
+          <div class="th-hint" style="text-align:center;margin-top:1px">%</div>
+        </div>
+        <div class="threshold-item">
+          <label>Minimum Duration</label>
+          <div class="th-hint">Shortest climb to report. Filters out brief ramps and overpasses. Typical: 20&ndash;60 seconds.</div>
+          <input type="number" id="thClimbMinDur" value="30" step="5" min="5">
+          <div class="th-hint" style="text-align:center;margin-top:1px">seconds</div>
+        </div>
+        <div class="threshold-item">
+          <label>Minimum Elevation Gain</label>
+          <div class="th-hint">Minimum total meters gained for a climb to be reported. Filters short steep bumps.</div>
+          <input type="number" id="thClimbMinGain" value="10" step="1" min="1">
+          <div class="th-hint" style="text-align:center;margin-top:1px">meters</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="th-group">
+      <div class="th-group-title"><span class="th-icon">&#x1F465;</span> Group Analysis</div>
+      <div class="threshold-grid" style="grid-template-columns: 1fr">
+        <div class="threshold-item">
+          <label>Time Window</label>
+          <div class="th-hint">When comparing multiple riders, moments within this window are grouped together. A 60s window means two riders&rsquo; sprints count as a &ldquo;group sprint&rdquo; if they happened within 60 seconds of each other.</div>
+          <input type="number" id="thTimeWindow" value="60" step="5" min="5" style="max-width:120px">
+          <div class="th-hint" style="max-width:120px;text-align:center;margin-top:1px">seconds</div>
+        </div>
+      </div>
+    </div>
+
     <div style="margin-top:12px">
       <button class="btn btn-primary btn-sm" onclick="redetectMoments()">Re-Analyze</button>
     </div>
   </div>
 
   <div class="card" id="moments-card">
-    <div class="card-title">Moments &amp; Achievements</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div class="card-title" style="margin-bottom:0">Moments &amp; Achievements</div>
+      <label style="display:inline-flex;align-items:center;gap:6px;font-size:0.78rem;color:var(--text-muted);cursor:pointer;user-select:none" title="Show HUD overlay (speed, power, gradient) in POV prompts">
+        <input type="checkbox" id="povHudToggle" checked onchange="povHudEnabled=this.checked" style="cursor:pointer">
+        POV HUD
+      </label>
+    </div>
     <div id="momentsContent"></div>
   </div>
 
@@ -3528,8 +3779,15 @@ function getThresholdParams() {
     '&climb_min_elevation_gain=' + ce + '&time_window=' + tw;
 }
 
-function fmtGarminTs(ts) {
+function fmtGarminTs(ts, lon) {
   const d = new Date((ts + 631065600) * 1000);
+  if (lon != null) {
+    // Estimate local time from longitude (offset = lon / 15 hours)
+    const offsetH = Math.round(lon / 15);
+    const local = new Date(d.getTime() + offsetH * 3600000);
+    const sign = offsetH >= 0 ? '+' : '';
+    return local.toISOString().replace('T', ' ').replace(/\\.\\d+Z/, '') + ' UTC' + sign + offsetH;
+  }
   return d.toISOString().replace('T', ' ').replace(/\\.\\d+Z/, ' UTC');
 }
 
@@ -3575,6 +3833,7 @@ function renderMoments(data) {
   html += '</div>';
 
   // Group moments by type
+  window._individualMoments = {};
   const byType = {};
   for (const m of moments) {
     if (!byType[m.type]) byType[m.type] = [];
@@ -3582,17 +3841,26 @@ function renderMoments(data) {
   }
 
   for (const [type, items] of Object.entries(byType)) {
+    if (!window._individualMoments[type]) window._individualMoments[type] = [];
     html += '<div class="moment-type-section">';
     html += '<div class="moment-type-header" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\\'none\\'?\\'block\\':\\'none\\'">';
     html += (MOMENT_ICONS[type] || '') + ' ' + (MOMENT_LABELS[type] || type) + ' (' + items.length + ') \\u25be</div>';
     html += '<ul class="moment-list" style="display:none">';
-    for (const m of items) {
+    for (let mi = 0; mi < items.length; mi++) {
+      const m = items[mi];
+      const globalIdx = window._individualMoments[type].length;
+      window._individualMoments[type].push(m);
       let detail = '';
       if (type === 'speed_surge') detail = (m.value * 3.6).toFixed(1) + ' km/h';
       else if (type === 'power_spike') detail = m.value + ' W';
       else if (type === 'sprint') detail = m.value + ' W peak, ' + m.duration + 's';
       else if (type === 'climb') detail = '+' + m.value + ' m, ' + fmtDuration(m.duration);
-      html += '<li class="' + type + '"><span>' + detail + '</span><span style="color:var(--text-muted)">' + fmtGarminTs(m.timestamp) + '</span></li>';
+      html += '<li class="' + type + '" onclick="selectIndividualMoment(\\'' + type + '\\',' + globalIdx + ',this)"><span>' + detail + '</span><span style="color:var(--text-muted)">' + fmtGarminTs(m.timestamp, m.lon) + '</span>' +
+        '<button class="copy-ai-btn moment-copy-btn" title="Copy AI Prompt" onclick="event.stopPropagation();toggleAiMenu(this)">\\ud83d\\udccb<div class="copy-ai-menu">' +
+        '<div onclick="event.stopPropagation();copyIndividualMoment(\\'' + type + '\\',' + globalIdx + ',\\'video\\')">\\ud83c\\udfac Video</div>' +
+        '<div onclick="event.stopPropagation();copyIndividualMoment(\\'' + type + '\\',' + globalIdx + ',\\'pov\\')">\\ud83c\\udfae POV</div>' +
+        '<div onclick="event.stopPropagation();copyIndividualMoment(\\'' + type + '\\',' + globalIdx + ',\\'data\\')">\\ud83d\\udcca Data</div>' +
+        '</div></button></li>';
     }
     html += '</ul></div>';
   }
@@ -3622,6 +3890,48 @@ function makeMomentIcon(type, isGroup) {
   });
 }
 
+function streetViewLink(lat, lon) {
+  return '<div style="margin-top:6px"><a href="https://www.google.com/maps/@' + lat + ',' + lon +
+    ',3a,75y,0h,90t/data=!3m6!1e1!3m4!1s!2e0!7i16384!8i8192" target="_blank" rel="noopener" ' +
+    'style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:#1a73e8;' +
+    'color:#fff;border-radius:4px;font-size:11px;font-weight:500;text-decoration:none">' +
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+    '<circle cx="12" cy="10" r="3"/><path d="M12 2a8 8 0 0 0-8 8c0 5.4 7 11.5 7.3 11.8a1 1 0 0 0 1.4 0C13 21.5 20 15.4 20 10a8 8 0 0 0-8-8z"/>' +
+    '</svg>Street View</a>' +
+    '<a href="https://www.google.com/maps?q=' + lat + ',' + lon + '" target="_blank" rel="noopener" ' +
+    'style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:#fff;' +
+    'color:#1a73e8;border:1px solid #dadce0;border-radius:4px;font-size:11px;font-weight:500;' +
+    'text-decoration:none;margin-left:4px">' +
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+    '<polygon points="3 11 22 2 13 21 11 13 3 11"/></svg>Maps</a></div>';
+}
+
+var highlightMarker = null;
+function highlightMomentOnMap(lat, lon, type) {
+  if (highlightMarker) { map.removeLayer(highlightMarker); highlightMarker = null; }
+  if (!map || lat == null || lon == null) return;
+  const color = MOMENT_COLORS[type] || '#2563eb';
+  highlightMarker = L.marker([lat, lon], {
+    icon: L.divIcon({
+      className: '',
+      iconSize: [40, 40],
+      iconAnchor: [20, 20],
+      html: '<div class="moment-highlight-ring" style="width:40px;height:40px;background:' + color + '30;"></div>'
+    }),
+    interactive: false,
+    zIndexOffset: 1000,
+  }).addTo(map);
+  map.setView([lat, lon], Math.max(map.getZoom(), 15), { animate: true });
+  // Open the matching moment marker popup
+  if (momentMarkerLayer) {
+    momentMarkerLayer.eachLayer(function(layer) {
+      if (layer.getLatLng && Math.abs(layer.getLatLng().lat - lat) < 0.00001 && Math.abs(layer.getLatLng().lng - lon) < 0.00001) {
+        layer.openPopup();
+      }
+    });
+  }
+}
+
 function addMomentMarkers(moments) {
   if (!map) return;
   if (!momentMarkerLayer) {
@@ -3637,8 +3947,11 @@ function addMomentMarkers(moments) {
     else if (m.type === 'power_spike') detail = m.value + ' W';
     else if (m.type === 'sprint') detail = m.value + ' W peak, ' + m.duration + 's';
     else if (m.type === 'climb') detail = '+' + m.value + ' m, ' + fmtDuration(m.duration);
+    let shapeHtml = '';
+    if (m.route_shape) shapeHtml = '<div class="route-shape-tag">' + m.route_shape.description + '</div>';
     L.marker([m.lat, m.lon], { icon: makeMomentIcon(m.type, false) })
-      .bindPopup('<b>' + (MOMENT_ICONS[m.type] || '') + ' ' + (MOMENT_LABELS[m.type] || m.type) + '</b><br>' + detail)
+      .bindPopup('<b>' + (MOMENT_ICONS[m.type] || '') + ' ' + (MOMENT_LABELS[m.type] || m.type) + '</b><br>' + detail + shapeHtml + streetViewLink(m.lat, m.lon),
+        { maxWidth: 280 })
       .addTo(momentMarkerLayer);
   }
 }
@@ -3652,8 +3965,11 @@ function addGroupMomentMarkers(groupMoments) {
     else if (gm.type === 'power_spike') detail += ', peak ' + gm.value + ' W';
     else if (gm.type === 'sprint') detail += ', peak ' + gm.value + ' W';
     else if (gm.type === 'climb') detail += ', +' + gm.value + ' m';
+    let shapeHtml = '';
+    if (gm.route_shape) shapeHtml = '<div class="route-shape-tag">' + gm.route_shape.description + '</div>';
     L.marker([gm.lat, gm.lon], { icon: makeMomentIcon(gm.type, true) })
-      .bindPopup('<b>' + (MOMENT_ICONS[gm.type] || '') + ' Group ' + (MOMENT_LABELS[gm.type] || gm.type) + '</b><br>' + detail)
+      .bindPopup('<b>' + (MOMENT_ICONS[gm.type] || '') + ' Group ' + (MOMENT_LABELS[gm.type] || gm.type) + '</b><br>' + detail + shapeHtml + streetViewLink(gm.lat, gm.lon),
+        { maxWidth: 280 })
       .addTo(momentMarkerLayer);
   }
 }
@@ -3686,20 +4002,27 @@ function renderGroupMoments(data) {
     return;
   }
 
+  window._groupMoments = gm;
   let html = '';
-  for (const m of gm) {
+  for (let gi = 0; gi < gm.length; gi++) {
+    const m = gm[gi];
     const icon = MOMENT_ICONS[m.type] || '';
     const label = MOMENT_LABELS[m.type] || m.type;
     let valStr = '';
     if (m.type === 'speed_surge') valStr = (m.value * 3.6).toFixed(1) + ' km/h';
     else if (m.type === 'power_spike' || m.type === 'sprint') valStr = m.value + ' W';
     else if (m.type === 'climb') valStr = '+' + m.value + ' m';
-    html += '<div class="group-moment-item">';
+    html += '<div class="group-moment-item" onclick="selectGroupMoment(' + gi + ',this)">';
     html += '<div class="group-moment-header">';
     html += '<span class="moment-badge ' + m.type + '">' + icon + ' ' + label + '</span>';
     html += '<span style="font-weight:600">' + m.member_count + ' riders</span>';
     html += '<span style="font-size:0.82rem;color:var(--text-muted)">Peak: ' + valStr + '</span>';
     if (m.duration) html += '<span style="font-size:0.82rem;color:var(--text-muted)">' + fmtDuration(m.duration) + '</span>';
+    if (m.timestamp) html += '<span style="font-size:0.75rem;color:var(--text-muted)">' + fmtGarminTs(m.timestamp, m.lon) + '</span>';
+    html += '<button class="copy-ai-btn" onclick="event.stopPropagation();toggleAiMenu(this)">\\ud83d\\udccb AI Prompt<div class="copy-ai-menu">' +
+      '<div onclick="event.stopPropagation();copyAiPrompt(' + gi + ',\\'video\\')">\\ud83c\\udfac Video Prompt</div>' +
+      '<div onclick="event.stopPropagation();copyAiPrompt(' + gi + ',\\'pov\\')">\\ud83c\\udfae POV Prompt</div>' +
+      '<div onclick="event.stopPropagation();copyAiPrompt(' + gi + ',\\'data\\')">\\ud83d\\udcca Data Prompt</div></div></button>';
     html += '</div>';
     html += '<div class="group-moment-members">';
     for (const mem of m.members) {
@@ -3708,21 +4031,30 @@ function renderGroupMoments(data) {
       if (m.type === 'speed_surge') memVal = (mem.value * 3.6).toFixed(1) + ' km/h';
       else if (m.type === 'power_spike' || m.type === 'sprint') memVal = mem.value + ' W';
       else if (m.type === 'climb') memVal = '+' + mem.value + ' m';
+      if (mem.timestamp) memVal += ' at ' + fmtGarminTs(mem.timestamp, m.lon || mem.lon);
       html += '<span>' + fname.replace(/\\.fit$/i, '') + ': ' + memVal + '</span>';
     }
     html += '</div></div>';
   }
 
+  window._groupAchievements = ga;
   if (ga.length > 0) {
     html += '<div style="margin-top:12px"><div style="font-weight:600;font-size:0.85rem;margin-bottom:8px">Group Achievements</div>';
-    for (const a of ga) {
-      html += '<div class="group-moment-item"><div class="group-moment-header">';
+    for (let ai = 0; ai < ga.length; ai++) {
+      const a = ga[ai];
+      html += '<div class="group-moment-item" onclick="selectGroupAchievement(' + ai + ',this)"><div class="group-moment-header">';
       html += '<span class="moment-badge speed_demon">' + (MOMENT_ICONS[a.type] || '\\ud83c\\udfc6') + ' ' + (MOMENT_LABELS[a.type] || a.type) + '</span>';
       html += '<span style="font-weight:600">' + a.member_count + ' riders</span>';
+      html += '<button class="copy-ai-btn" onclick="event.stopPropagation();toggleAiMenu(this)">\\ud83d\\udccb AI Prompt<div class="copy-ai-menu">' +
+        '<div onclick="event.stopPropagation();copyAchievementPrompt(' + ai + ',\\'video\\')">\\ud83c\\udfac Video Prompt</div>' +
+        '<div onclick="event.stopPropagation();copyAchievementPrompt(' + ai + ',\\'pov\\')">\\ud83c\\udfae POV Prompt</div>' +
+        '<div onclick="event.stopPropagation();copyAchievementPrompt(' + ai + ',\\'data\\')">\\ud83d\\udcca Data Prompt</div></div></button>';
       html += '</div><div class="group-moment-members">';
       for (const mem of a.members) {
         const fname = files[mem.file_id] ? files[mem.file_id].filename : mem.file_id;
-        html += '<span>' + fname.replace(/\\.fit$/i, '') + ': ' + mem.value + ' km/h</span>';
+        let memExtra = mem.value + ' km/h';
+        if (mem.timestamp) memExtra += ' at ' + fmtGarminTs(mem.timestamp, mem.lon);
+        html += '<span>' + fname.replace(/\\.fit$/i, '') + ': ' + memExtra + '</span>';
       }
       html += '</div></div>';
     }
@@ -3740,6 +4072,446 @@ function redetectMoments() {
   if (fids.length === 0) return;
   // Re-analyze each file
   const promises = fids.map(fid => loadMoments(fid));
+}
+
+function toggleAiMenu(btn) {
+  const menu = btn.querySelector('.copy-ai-menu');
+  const wasOpen = menu.classList.contains('show');
+  document.querySelectorAll('.copy-ai-menu.show').forEach(m => m.classList.remove('show'));
+  if (!wasOpen) menu.classList.add('show');
+}
+document.addEventListener('click', function() {
+  document.querySelectorAll('.copy-ai-menu.show').forEach(m => m.classList.remove('show'));
+});
+
+function getTimeOfDay(ts, lon) {
+  const d = new Date((ts + 631065600) * 1000);
+  const offsetH = (lon != null) ? Math.round(lon / 15) : 0;
+  const h = (d.getUTCHours() + offsetH + 24) % 24;
+  if (h < 6) return 'pre-dawn';
+  if (h < 10) return 'morning';
+  if (h < 14) return 'midday';
+  if (h < 17) return 'afternoon';
+  if (h < 20) return 'evening';
+  return 'night';
+}
+
+function streetViewUrl(lat, lon) {
+  return 'https://www.google.com/maps/@' + lat + ',' + lon + ',3a,75y,0h,90t/data=!3m6!1e1!3m4!1s!2e0!7i16384!8i8192';
+}
+
+function mapsUrl(lat, lon) {
+  return 'https://www.google.com/maps?q=' + lat + ',' + lon;
+}
+
+function momentValStr(type, value) {
+  if (type === 'speed_surge') return (value * 3.6).toFixed(1) + ' km/h';
+  if (type === 'power_spike' || type === 'sprint') return value + ' W';
+  if (type === 'climb') return '+' + value + ' m';
+  return String(value);
+}
+
+function buildVideoPrompt(m) {
+  const label = MOMENT_LABELS[m.type] || m.type;
+  const tod = m.timestamp ? getTimeOfDay(m.timestamp, m.lon) : 'daytime';
+  const riderCount = m.members ? m.members.length : 1;
+  const peak = momentValStr(m.type, m.value);
+  let riders = '';
+  if (m.members) {
+    riders = m.members.map(function(mem) {
+      const fname = files[mem.file_id] ? files[mem.file_id].filename.replace(/\\.fit$/i, '') : mem.file_id;
+      return fname + ' at ' + momentValStr(m.type, mem.value);
+    }).join(', ');
+  }
+  let prompt = 'Cinematic cycling scene: ' + riderCount + ' cyclist' + (riderCount > 1 ? 's' : '') + ' in a ' + label.toLowerCase() + ' at high intensity.\\n\\n';
+  prompt += 'Setting: ' + tod + ' ride';
+  if (m.route_shape) prompt += ', ' + m.route_shape.description;
+  if (m.lat != null && m.lon != null) prompt += ', at GPS ' + m.lat.toFixed(4) + ', ' + m.lon.toFixed(4);
+  prompt += '.\\n\\n';
+  prompt += 'Key metrics:\\n';
+  prompt += '- Event: ' + label + '\\n';
+  prompt += '- Peak: ' + peak + '\\n';
+  if (m.timestamp) prompt += '- Time: ' + fmtGarminTs(m.timestamp, m.lon) + '\\n';
+  if (m.duration) prompt += '- Duration: ' + m.duration + 's\\n';
+  if (riders) prompt += '- Riders: ' + riders + '\\n';
+  if (m.lat != null && m.lon != null) {
+    prompt += '\\nLocation reference (Street View):\\n' + streetViewUrl(m.lat, m.lon) + '\\n';
+  }
+  if (m.route_shape) {
+    prompt += '\\nRoad: ' + m.route_shape.turn + '. Camera should follow the ' + (m.route_shape.turn === 'straight road' ? 'road ahead' : 'curve direction') + '.';
+  }
+  prompt += '\\nStyle: Realistic, dynamic camera angles, motion blur on wheels, road-level perspective. Dramatic lighting with ' + tod + ' atmosphere.';
+  return prompt;
+}
+
+function buildDataPrompt(m) {
+  const label = MOMENT_LABELS[m.type] || m.type;
+  let prompt = '# Cycling Group Moment Data\\n\\n';
+  prompt += '## Event: ' + label + '\\n';
+  prompt += '- Type: ' + m.type + '\\n';
+  prompt += '- Peak Value: ' + momentValStr(m.type, m.value) + '\\n';
+  if (m.duration) prompt += '- Duration: ' + m.duration + 's (' + fmtDuration(m.duration) + ')\\n';
+  if (m.member_count) prompt += '- Rider Count: ' + m.member_count + '\\n';
+  if (m.timestamp) prompt += '- Timestamp: ' + fmtGarminTs(m.timestamp, m.lon) + '\\n';
+  if (m.lat != null && m.lon != null) {
+    prompt += '- GPS: ' + m.lat.toFixed(6) + ', ' + m.lon.toFixed(6) + '\\n';
+    prompt += '- Google Maps: ' + mapsUrl(m.lat, m.lon) + '\\n';
+    prompt += '- Street View: ' + streetViewUrl(m.lat, m.lon) + '\\n';
+  }
+  if (m.route_shape) {
+    prompt += '\\n## Road Shape\\n';
+    prompt += '- Road Shape: ' + m.route_shape.description + '\\n';
+    prompt += '- Turn: ' + m.route_shape.turn + '\\n';
+    prompt += '- Turn Angle: ' + m.route_shape.turn_angle + '°\\n';
+    prompt += '- Gradient: ' + m.route_shape.gradient_pct + '%\\n';
+    prompt += '- Gradient Type: ' + m.route_shape.gradient_desc + '\\n';
+  }
+  if (m.members && m.members.length > 0) {
+    prompt += '\\n## Rider Breakdown\\n';
+    for (const mem of m.members) {
+      const fname = files[mem.file_id] ? files[mem.file_id].filename.replace(/\\.fit$/i, '') : mem.file_id;
+      prompt += '- ' + fname + ': ' + momentValStr(m.type, mem.value);
+      if (mem.timestamp) prompt += ' at ' + fmtGarminTs(mem.timestamp, m.lon || mem.lon);
+      if (mem.duration) prompt += ' (' + mem.duration + 's)';
+      prompt += '\\n';
+    }
+  }
+  prompt += '\\n## Suggested Uses\\n';
+  prompt += '- Video generation (Sora/Runway): Use the metrics and location for a cycling scene\\n';
+  prompt += '- Image generation (Midjourney): Create a dramatic cycling moment illustration\\n';
+  prompt += '- Analysis (ChatGPT/Claude): Analyze rider performance and group dynamics\\n';
+  return prompt;
+}
+
+var povHudEnabled = true;
+
+function todAtmosphere(tod) {
+  var map = {'pre-dawn':'deep blue sky with soft horizon glow, neon-lit road markings, cool ambient lighting','morning':'warm golden light, vibrant green foliage, bright clean sky with soft clouds','midday':'bright vivid lighting, saturated colors, sharp clean shadows on smooth road','afternoon':'warm amber sunlight, rich golden tones on buildings and trees','evening':'deep orange and purple sky, glowing road markings, warm dramatic lighting','night':'dark sky with stylized stars, glowing street lights, neon road markings illuminated'};
+  return map[tod] || 'bright vivid daylight';
+}
+
+function describeRoadAhead(rs) {
+  if (!rs) return 'smooth open road stretching ahead with bold yellow center line';
+  var t = rs.turn || 'straight road';
+  var g = rs.gradient_desc || 'flat';
+  if (t === 'straight road' && g === 'flat') return 'straight smooth road stretching ahead, bold lane markings, flat terrain';
+  if (t === 'straight road') {
+    if (g === 'downhill') return 'smooth road descending ahead, bold lane markings flowing downhill';
+    if (g === 'slight uphill' || g === 'uphill') return 'road rising ahead, gradient visible on the clean asphalt surface';
+    if (g === 'steep climb' || g === 'very steep') return 'steep road climbing sharply upward, bold lane markings ascending';
+  }
+  var dir = t.indexOf('right') >= 0 ? 'right' : 'left';
+  if (t.indexOf('gentle') >= 0) return 'smooth road sweeping gently to the ' + dir + ', bold lane markings curving ahead';
+  if (t.indexOf('sharp') >= 0) return 'sharp ' + dir + ' turn ahead, road curving with visible lane markings';
+  if (t.indexOf('hairpin') >= 0) return 'tight hairpin ' + dir + ' bend ahead, road folding back on itself';
+  if (t === 'U-turn') return 'tight switchback ahead, road doubling back sharply';
+  return 'road curving to the ' + dir + ' ahead, bold lane markings guiding the way';
+}
+
+function describeGroupRiders(m) {
+  if (!m.members || m.members.length <= 1) return '';
+  var lines = [];
+  var sorted = m.members.slice().sort(function(a, b) { return b.value - a.value; });
+  for (var ri = 0; ri < sorted.length; ri++) {
+    var mem = sorted[ri];
+    var fname = files[mem.file_id] ? files[mem.file_id].filename.replace(/\\.fit$/i, '') : mem.file_id;
+    var pos;
+    if (ri === 0) pos = 'leading the group ahead';
+    else if (ri === sorted.length - 1) pos = 'visible behind, chasing';
+    else if (mem.value >= m.value * 0.95) pos = 'riding alongside, matching pace';
+    else pos = 'slightly behind, drafting';
+    lines.push(fname + ': ' + pos + ' (' + momentValStr(m.type, mem.value) + ')');
+  }
+  return lines.join('\\n');
+}
+
+function buildPovPrompt(m) {
+  var label = MOMENT_LABELS[m.type] || m.type;
+  var tod = m.timestamp ? getTimeOfDay(m.timestamp, m.lon) : 'daytime';
+  var riderCount = m.members ? m.members.length : 1;
+  var peak = momentValStr(m.type, m.value);
+  var road = describeRoadAhead(m.route_shape);
+
+  var prompt = 'Zwift-style 3D cycling game scene during a ' + label.toLowerCase() + '.\\n\\n';
+  prompt += 'Camera: First-person rider\\'s eye view looking forward at the road. The stylized 3D road and world fill the upper 70% of the frame. In the lower portion, the handlebars and the rider\\'s gloved hands gripping the drops are clearly visible';
+  if (povHudEnabled) prompt += ', bike computer mounted on stem showing ' + peak;
+  prompt += '.\\n\\n';
+  prompt += 'World: Stylized 3D game environment — smooth clean roads with bold yellow/white lane markings, vibrant low-poly trees and buildings lining the road, saturated colors, polished game-engine look (similar to Zwift). Not photorealistic.\\n\\n';
+  prompt += 'Road ahead: ' + road + '.\\n\\n';
+  prompt += 'Atmosphere: ' + todAtmosphere(tod) + '.\\n\\n';
+
+  if (riderCount > 1 && m.members) {
+    prompt += 'Other riders on the road:\\n';
+    prompt += describeGroupRiders(m) + '\\n\\n';
+  }
+
+  prompt += 'Key metrics:\\n';
+  prompt += '- Event: ' + label + '\\n';
+  prompt += '- Peak: ' + peak + '\\n';
+  if (m.timestamp) prompt += '- Time: ' + fmtGarminTs(m.timestamp, m.lon) + '\\n';
+  if (m.duration) prompt += '- Duration: ' + m.duration + 's\\n';
+
+  if (povHudEnabled) {
+    prompt += '\\nHUD overlay (game-style):\\n';
+    prompt += '- Speed: ' + (m.type === 'speed_surge' ? (m.value * 3.6).toFixed(1) + ' km/h' : 'visible on computer') + '\\n';
+    if (m.type === 'power_spike' || m.type === 'sprint') prompt += '- Power: ' + m.value + ' W\\n';
+    if (m.route_shape) prompt += '- Gradient: ' + m.route_shape.gradient_pct + '%\\n';
+    if (m.duration) prompt += '- Timer: ' + fmtDuration(m.duration) + '\\n';
+  }
+
+  if (m.lat != null && m.lon != null) {
+    prompt += '\\nLocation reference (Street View):\\n' + streetViewUrl(m.lat, m.lon) + '\\n';
+  }
+  prompt += '\\nStyle: Zwift-style 3D game graphics. Vibrant saturated colors, smooth clean geometry, polished stylized world. Road and scenery fill upper frame, handlebars and gloved hands visible in lower frame. Slight motion blur on road. ' + todAtmosphere(tod) + '.';
+  return prompt;
+}
+
+function buildIndividualPovPrompt(m, type) {
+  var label = MOMENT_LABELS[type] || type;
+  var tod = m.timestamp ? getTimeOfDay(m.timestamp, m.lon) : 'daytime';
+  var val = momentValStr(type, m.value);
+  var fname = currentMomentsFileId && files[currentMomentsFileId] ? files[currentMomentsFileId].filename.replace(/\\.fit$/i, '') : 'Cyclist';
+  var road = describeRoadAhead(m.route_shape);
+
+  var prompt = '# POV Cycling Moment: ' + label + '\\n\\n';
+  prompt += '- Rider: ' + fname + '\\n';
+  prompt += '- Value: ' + val + '\\n';
+  if (m.duration) prompt += '- Duration: ' + m.duration + 's (' + fmtDuration(m.duration) + ')\\n';
+  if (m.timestamp) prompt += '- Time: ' + fmtGarminTs(m.timestamp, m.lon) + ' (' + tod + ')\\n';
+  if (m.lat != null && m.lon != null) {
+    prompt += '- GPS: ' + m.lat.toFixed(6) + ', ' + m.lon.toFixed(6) + '\\n';
+    prompt += '- Street View: ' + streetViewUrl(m.lat, m.lon) + '\\n';
+  }
+  if (m.route_shape) prompt += '- Road: ' + m.route_shape.description + '\\n';
+
+  prompt += '\\nZwift-style 3D game scene: First-person view looking forward at a stylized road. Handlebars and gloved hands visible in the lower portion of the frame. ' + road + '. Vibrant low-poly trees and buildings lining the route, bold lane markings on smooth clean road';
+  if (povHudEnabled) prompt += ', bike computer reads ' + val;
+  prompt += '. ';
+  prompt += (type === 'climb' ? 'Road tilting upward, terrain rising around the rider, gradient visible' : type === 'sprint' ? 'Road surface streaking with speed, bold lane markings blurring past' : 'Road stretching ahead into the stylized world, speed building');
+  prompt += '. ' + todAtmosphere(tod) + '.';
+  if (povHudEnabled && m.route_shape) prompt += ' HUD shows gradient ' + m.route_shape.gradient_pct + '%.';
+  return prompt;
+}
+
+function buildAchievementPovPrompt(a) {
+  var label = MOMENT_LABELS[a.type] || a.type;
+  var riderCount = a.members ? a.members.length : 1;
+  var earliestTs = null;
+  var lat = null, lon = null;
+  var riders = '';
+  if (a.members) {
+    riders = a.members.map(function(mem) {
+      var fname = files[mem.file_id] ? files[mem.file_id].filename.replace(/\\.fit$/i, '') : mem.file_id;
+      if (mem.timestamp && (earliestTs === null || mem.timestamp < earliestTs)) earliestTs = mem.timestamp;
+      if (mem.lat != null) { lat = mem.lat; lon = mem.lon; }
+      return fname + ' at ' + mem.value + ' km/h';
+    }).join(', ');
+  }
+  var tod = earliestTs ? getTimeOfDay(earliestTs, lon) : 'daytime';
+
+  var prompt = 'Zwift-style 3D cycling game scene — ' + label.toLowerCase() + ' achieved!\\n\\n';
+  prompt += 'Camera: First-person rider\\'s eye view at extreme speed. Stylized 3D road fills the upper frame — bold lane markings streaking past, vibrant game world blurring on the sides. Handlebars and gloved hands in aero tuck visible in the lower portion of the frame';
+  if (povHudEnabled) prompt += ', bike computer flashing ' + a.max_value + ' km/h';
+  prompt += '.\\n\\n';
+  prompt += 'World: Stylized 3D game environment — smooth clean roads, vibrant low-poly scenery, saturated colors, polished game-engine look (similar to Zwift).\\n\\n';
+  prompt += 'Atmosphere: ' + todAtmosphere(tod) + '.\\n\\n';
+
+  if (riderCount > 1) {
+    prompt += 'Other riders visible: ' + (riderCount - 1) + ' cyclist' + (riderCount > 2 ? 's' : '') + ' on the road — some behind drafting, others being overtaken.\\n';
+    if (riders) prompt += 'Riders: ' + riders + '\\n';
+    prompt += '\\n';
+  }
+
+  prompt += 'Key metrics:\\n';
+  prompt += '- Achievement: ' + label + '\\n';
+  prompt += '- Max Speed: ' + a.max_value + ' km/h\\n';
+  if (earliestTs) prompt += '- Time: ' + fmtGarminTs(earliestTs, lon) + '\\n';
+  if (lat != null) prompt += '\\nLocation reference (Street View):\\n' + streetViewUrl(lat, lon) + '\\n';
+
+  if (povHudEnabled) {
+    prompt += '\\nHUD overlay: Speed ' + a.max_value + ' km/h (flashing/highlighted as achievement unlocked).\\n';
+  }
+  prompt += '\\nStyle: Zwift-style 3D game graphics. Vibrant saturated colors, smooth clean geometry, polished stylized world. Road and scenery fill upper frame, handlebars and gloved hands visible in lower frame. Bold markings blurring at speed. ' + todAtmosphere(tod) + '.';
+  return prompt;
+}
+
+function copyAiPrompt(idx, variant) {
+  document.querySelectorAll('.copy-ai-menu.show').forEach(m => m.classList.remove('show'));
+  const gm = window._groupMoments || [];
+  if (idx < 0 || idx >= gm.length) return;
+  const m = gm[idx];
+  const text = variant === 'pov' ? buildPovPrompt(m) : variant === 'data' ? buildDataPrompt(m) : buildVideoPrompt(m);
+  copyToClipboard(text);
+}
+
+function buildIndividualPrompt(m, type) {
+  const label = MOMENT_LABELS[type] || type;
+  const tod = m.timestamp ? getTimeOfDay(m.timestamp, m.lon) : 'daytime';
+  const val = momentValStr(type, m.value);
+  const fname = currentMomentsFileId && files[currentMomentsFileId] ? files[currentMomentsFileId].filename.replace(/\\.fit$/i, '') : 'Cyclist';
+  let prompt = '# Cycling Moment: ' + label + '\\n\\n';
+  prompt += '- Rider: ' + fname + '\\n';
+  prompt += '- Value: ' + val + '\\n';
+  if (m.duration) prompt += '- Duration: ' + m.duration + 's (' + fmtDuration(m.duration) + ')\\n';
+  if (m.timestamp) prompt += '- Time: ' + fmtGarminTs(m.timestamp, m.lon) + ' (' + tod + ')\\n';
+  if (m.lat != null && m.lon != null) {
+    prompt += '- GPS: ' + m.lat.toFixed(6) + ', ' + m.lon.toFixed(6) + '\\n';
+    prompt += '- Street View: ' + streetViewUrl(m.lat, m.lon) + '\\n';
+    prompt += '- Maps: ' + mapsUrl(m.lat, m.lon) + '\\n';
+  }
+  if (m.route_shape) {
+    prompt += '- Road: ' + m.route_shape.description + '\\n';
+  }
+  prompt += '\\nCinematic prompt: A cyclist ' + (type === 'climb' ? 'climbing' : type === 'sprint' ? 'sprinting' : 'surging') + ' at ' + val;
+  prompt += ' during a ' + tod + ' ride. Realistic, dynamic angles, motion blur on wheels.';
+  return prompt;
+}
+
+function buildAchievementVideoPrompt(a) {
+  const label = MOMENT_LABELS[a.type] || a.type;
+  const riderCount = a.members ? a.members.length : 1;
+  let riders = '';
+  let earliestTs = null;
+  let lat = null, lon = null;
+  if (a.members) {
+    riders = a.members.map(function(mem) {
+      const fname = files[mem.file_id] ? files[mem.file_id].filename.replace(/\\.fit$/i, '') : mem.file_id;
+      if (mem.timestamp && (earliestTs === null || mem.timestamp < earliestTs)) earliestTs = mem.timestamp;
+      if (mem.lat != null) { lat = mem.lat; lon = mem.lon; }
+      return fname + ' at ' + mem.value + ' km/h';
+    }).join(', ');
+  }
+  const tod = earliestTs ? getTimeOfDay(earliestTs, lon) : 'daytime';
+  let prompt = 'Cinematic cycling scene: ' + riderCount + ' cyclist' + (riderCount > 1 ? 's' : '') + ' achieving ' + label.toLowerCase() + ' status at extreme speed.\\n\\n';
+  prompt += 'Setting: ' + tod + ' ride';
+  if (lat != null) prompt += ' at GPS ' + lat.toFixed(4) + ', ' + lon.toFixed(4);
+  prompt += '.\\n\\n';
+  prompt += 'Key metrics:\\n';
+  prompt += '- Achievement: ' + label + '\\n';
+  prompt += '- Max Speed: ' + a.max_value + ' km/h\\n';
+  if (earliestTs) prompt += '- Time: ' + fmtGarminTs(earliestTs, lon) + '\\n';
+  if (riders) prompt += '- Riders: ' + riders + '\\n';
+  if (lat != null) prompt += '\\nLocation reference (Street View):\\n' + streetViewUrl(lat, lon) + '\\n';
+  prompt += '\\nStyle: Realistic, dynamic camera angles, extreme speed effect, motion blur on wheels and road, road-level perspective. Dramatic ' + tod + ' lighting.';
+  return prompt;
+}
+
+function buildAchievementDataPrompt(a) {
+  const label = MOMENT_LABELS[a.type] || a.type;
+  let prompt = '# Cycling Group Achievement Data\\n\\n';
+  prompt += '## Achievement: ' + label + '\\n';
+  prompt += '- Type: ' + a.type + '\\n';
+  prompt += '- Max Value: ' + a.max_value + ' km/h\\n';
+  if (a.member_count) prompt += '- Rider Count: ' + a.member_count + '\\n';
+  if (a.members && a.members.length > 0) {
+    prompt += '\\n## Rider Breakdown\\n';
+    for (const mem of a.members) {
+      const fname = files[mem.file_id] ? files[mem.file_id].filename.replace(/\\.fit$/i, '') : mem.file_id;
+      prompt += '- ' + fname + ': ' + mem.value + ' km/h';
+      if (mem.timestamp) prompt += ' at ' + fmtGarminTs(mem.timestamp, mem.lon);
+      if (mem.lat != null) {
+        prompt += '\\n  - Street View: ' + streetViewUrl(mem.lat, mem.lon);
+        prompt += '\\n  - Maps: ' + mapsUrl(mem.lat, mem.lon);
+      }
+      prompt += '\\n';
+    }
+  }
+  prompt += '\\n## Suggested Uses\\n';
+  prompt += '- Video generation (Sora/Runway): Capture the extreme speed moment with dramatic visuals\\n';
+  prompt += '- Image generation (Midjourney): Create a speed demon cycling illustration\\n';
+  prompt += '- Analysis (ChatGPT/Claude): Compare rider peak speeds and conditions\\n';
+  return prompt;
+}
+
+function copyAchievementPrompt(idx, variant) {
+  document.querySelectorAll('.copy-ai-menu.show').forEach(m => m.classList.remove('show'));
+  const ga = window._groupAchievements || [];
+  if (idx < 0 || idx >= ga.length) return;
+  const a = ga[idx];
+  const text = variant === 'pov' ? buildAchievementPovPrompt(a) : variant === 'data' ? buildAchievementDataPrompt(a) : buildAchievementVideoPrompt(a);
+  copyToClipboard(text);
+}
+
+function clearMomentSelection() {
+  document.querySelectorAll('.moment-list li.moment-active').forEach(function(el) { el.classList.remove('moment-active'); });
+  document.querySelectorAll('.group-moment-item.moment-active').forEach(function(el) { el.classList.remove('moment-active'); });
+  if (highlightMarker && map) { map.removeLayer(highlightMarker); highlightMarker = null; }
+}
+
+function selectIndividualMoment(type, idx, el) {
+  const moments = (window._individualMoments || {})[type] || [];
+  if (idx < 0 || idx >= moments.length) return;
+  const m = moments[idx];
+  const wasActive = el.classList.contains('moment-active');
+  clearMomentSelection();
+  if (wasActive) return;
+  el.classList.add('moment-active');
+  if (m.lat != null && m.lon != null) highlightMomentOnMap(m.lat, m.lon, m.type || type);
+}
+
+function selectGroupMoment(idx, el) {
+  const gm = window._groupMoments || [];
+  if (idx < 0 || idx >= gm.length) return;
+  const m = gm[idx];
+  const wasActive = el.classList.contains('moment-active');
+  clearMomentSelection();
+  if (wasActive) return;
+  el.classList.add('moment-active');
+  if (m.lat != null && m.lon != null) highlightMomentOnMap(m.lat, m.lon, m.type);
+}
+
+function selectGroupAchievement(idx, el) {
+  const ga = window._groupAchievements || [];
+  if (idx < 0 || idx >= ga.length) return;
+  const a = ga[idx];
+  const wasActive = el.classList.contains('moment-active');
+  clearMomentSelection();
+  if (wasActive) return;
+  el.classList.add('moment-active');
+  // Find first member with GPS
+  var lat = null, lon = null;
+  if (a.members) {
+    for (var k = 0; k < a.members.length; k++) {
+      if (a.members[k].lat != null && a.members[k].lon != null) {
+        lat = a.members[k].lat;
+        lon = a.members[k].lon;
+        break;
+      }
+    }
+  }
+  if (lat != null && lon != null) highlightMomentOnMap(lat, lon, a.type);
+}
+
+function copyIndividualMoment(type, idx, variant) {
+  document.querySelectorAll('.copy-ai-menu.show').forEach(function(m) { m.classList.remove('show'); });
+  const moments = (window._individualMoments || {})[type] || [];
+  if (idx < 0 || idx >= moments.length) return;
+  const m = moments[idx];
+  const text = variant === 'pov' ? buildIndividualPovPrompt(m, type) : variant === 'data' ? buildIndividualPrompt(m, type) : buildIndividualPrompt(m, type);
+  copyToClipboard(text);
+}
+
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function() { showCopyToast('Copied to clipboard!'); }).catch(function() { fallbackCopy(text); });
+  } else {
+    fallbackCopy(text);
+  }
+}
+
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); showCopyToast('Copied to clipboard!'); } catch (e) { showCopyToast('Copy failed'); }
+  document.body.removeChild(ta);
+}
+
+function showCopyToast(msg) {
+  const t = document.createElement('div');
+  t.className = 'copy-toast'; t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(function() { t.remove(); }, 2300);
 }
 
 function exportReport() {
