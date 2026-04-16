@@ -2511,6 +2511,12 @@ HTML_PAGE = """<!DOCTYPE html>
     background: var(--primary); border: 2px solid white;
     box-shadow: 0 0 6px rgba(37,99,235,0.5);
   }
+  .route-arrow {
+    width: 0; height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-bottom: 10px solid #2563eb;
+  }
   /* Highlight marker for selected moment */
   .moment-highlight-ring {
     border-radius: 50%;
@@ -2669,7 +2675,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="card" id="map-card">
     <div class="card-title">Route Map</div>
     <div id="map"></div>
-    <div class="map-info" id="mapInfo"></div>
+    <div style="display:flex;align-items:center;gap:8px"><div class="map-info" id="mapInfo"></div><button id="copyCoordsBtn" style="display:none;padding:2px 8px;font-size:0.72rem;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);cursor:pointer" onclick="copyCoordinates()" title="Copy coordinates as [lon, lat] array">&#x1f4cb; Coords</button></div>
     <div class="map-legend" id="mapLegend">
       <span><span class="legend-dot" style="background:#22c55e"></span>Start</span>
       <span><span class="legend-dot" style="background:#ef4444"></span>Finish</span>
@@ -2813,6 +2819,19 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
     </div>
 
+    <div style="margin-top:12px;padding-top:12px;border-top:1px solid #334155">
+      <label style="font-size:11px;color:#94a3b8;display:block;margin-bottom:4px">Flick Weather</label>
+      <select id="flickWeatherSelect" onchange="flickWeather=this.value" style="width:100%;padding:6px 8px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;font-size:12px">
+        <option value="auto">Auto (from time of day)</option>
+        <option value="sunny">Sunny</option>
+        <option value="rain">Rain</option>
+        <option value="golden_hour">Golden Hour</option>
+        <option value="overcast">Overcast</option>
+        <option value="night">Night</option>
+        <option value="foggy">Foggy</option>
+        <option value="hot_midday">Hot Midday</option>
+      </select>
+    </div>
     <div style="margin-top:12px">
       <button class="btn btn-primary btn-sm" onclick="redetectMoments()">Re-Analyze</button>
     </div>
@@ -2921,6 +2940,27 @@ function initMap() {
   cursorMarker.setOpacity(0);
 }
 
+function addRouteArrows(latlngs, color, layer) {
+  if (latlngs.length < 10) return;
+  var step = Math.max(Math.floor(latlngs.length / 15), 5);
+  for (var i = step; i < latlngs.length - 1; i += step) {
+    var curr = latlngs[i];
+    var next = latlngs[Math.min(i + 1, latlngs.length - 1)];
+    var dLon = (next[1] - curr[1]) * Math.PI / 180;
+    var lat1 = curr[0] * Math.PI / 180;
+    var lat2 = next[0] * Math.PI / 180;
+    var x = Math.sin(dLon) * Math.cos(lat2);
+    var y = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+    var bearing = (Math.atan2(x, y) * 180 / Math.PI + 360) % 360;
+    var icon = L.divIcon({
+      className: '',
+      iconSize: [10, 10],
+      iconAnchor: [5, 5],
+      html: '<div class="route-arrow" style="border-bottom-color:' + color + ';transform:rotate(' + bearing + 'deg)"></div>'
+    });
+    L.marker(curr, { icon: icon, interactive: false }).addTo(layer);
+  }
+}
 async function loadRoute(fileId, color, showMarkers) {
   try {
     const r = await fetch('/gps/' + fileId);
@@ -2936,6 +2976,7 @@ async function loadRoute(fileId, color, showMarkers) {
     color = color || '#2563eb';
 
     L.polyline(latlngs, { color: color, weight: 3.5, opacity: 0.85 }).addTo(routeLayer);
+    addRouteArrows(latlngs, color, routeLayer);
 
     if (showMarkers !== false) {
       L.circleMarker(latlngs[0], {
@@ -2949,6 +2990,7 @@ async function loadRoute(fileId, color, showMarkers) {
     const bounds = L.latLngBounds(latlngs).pad(0.05);
     map.fitBounds(bounds);
     document.getElementById('mapInfo').textContent = d.points.length + ' GPS points';
+    document.getElementById('copyCoordsBtn').style.display = '';
     setTimeout(() => { map.invalidateSize(); map.fitBounds(bounds); }, 200);
   } catch (e) {
     console.warn('Map load error:', e);
@@ -2964,6 +3006,20 @@ function hideMap() {
   document.getElementById('map-card').classList.remove('active');
   clearMapLayers();
   document.getElementById('mapInfo').textContent = '';
+  document.getElementById('copyCoordsBtn').style.display = 'none';
+}
+
+async function copyCoordinates() {
+  var id = currentFileId || Object.keys(files)[0];
+  if (!id) return;
+  try {
+    var r = await fetch('/gps/' + id);
+    var d = await r.json();
+    if (!d.points || d.points.length === 0) { showCopyToast('No GPS data'); return; }
+    var coords = d.points.map(function(p) { return [parseFloat(p[1].toFixed(6)), parseFloat(p[0].toFixed(6))]; });
+    var text = JSON.stringify(coords, null, 2);
+    copyToClipboard(text);
+  } catch (e) { showCopyToast('Failed to copy coordinates'); }
 }
 
 function log(msg, cls) {
@@ -3763,6 +3819,215 @@ const MOMENT_ICONS = { speed_surge: '\\ud83c\\udfce\\ufe0f', power_spike: '\\u26
 const MOMENT_COLORS = { speed_surge: '#e6198a', power_spike: '#d97706', sprint: '#dc2626', climb: '#15803d' };
 const MOMENT_LABELS = { speed_surge: 'Speed Surge', power_spike: 'Power Spike', sprint: 'Sprint', climb: 'Climb', speed_demon: 'Speed Demon' };
 
+// Location Characteristic Profiles for Flick POV prompt accuracy
+var LOCATION_PROFILES = {
+  singapore: {
+    bounds: { minLat: 1.15, maxLat: 1.47, minLon: 103.60, maxLon: 104.05 },
+    name: 'Singapore',
+    positive_elements: [
+      'modern glass-and-steel high-rise buildings',
+      'tropical palm trees and manicured hedges',
+      'wide smooth asphalt road with bold white lane markings',
+      'covered bus stops and modern street lighting',
+      'clean urban infrastructure',
+      'HDB flats or modern condominiums in background',
+      'Southeast Asian riders'
+    ],
+    negative_elements: [
+      'power poles', 'overhead utility wires', 'old European-style buildings',
+      'rural farmland', 'snow', 'bare winter trees', 'wooden houses',
+      'unpaved roads', 'dirt tracks'
+    ],
+    environment_desc: 'Modern Singapore urban road with smooth wide asphalt, glass buildings on both sides, tropical palm trees, manicured greenery, covered walkways, modern street lighting. Clean, orderly infrastructure. Underground cables (no overhead wires).'
+  },
+  bali_coast: {
+    bounds: { minLat: -8.85, maxLat: -8.50, minLon: 115.05, maxLon: 115.45 },
+    name: 'Bali (Coastal)',
+    positive_elements: [
+      'winding coastal road with ocean glimpses',
+      'Balinese stone temples and carved gates',
+      'tropical frangipani and bougainvillea',
+      'rice terraces visible in background',
+      'low-rise traditional buildings with thatched or tiled roofs',
+      'occasional overhead power lines',
+      'scooters and local traffic',
+      'Southeast Asian riders'
+    ],
+    negative_elements: [
+      'skyscrapers', 'glass high-rise buildings', 'highway overpasses',
+      'snow', 'pine trees', 'European architecture', 'neon signs',
+      'subway entrances'
+    ],
+    environment_desc: 'Balinese coastal road winding past stone temples, tropical vegetation, and low-rise traditional buildings. Rice terraces in the distance. Warm tropical atmosphere with lush green foliage. Occasional overhead power lines.'
+  },
+  bali_mountain: {
+    bounds: { minLat: -8.50, maxLat: -8.15, minLon: 115.20, maxLon: 115.60 },
+    name: 'Bali (Mountain)',
+    positive_elements: [
+      'steep mountain road with volcanic backdrop',
+      'dense tropical forest on both sides',
+      'terraced rice paddies on hillside',
+      'stone walls and small roadside temples',
+      'mist or low clouds around peaks',
+      'narrow winding road with rough asphalt',
+      'Southeast Asian riders'
+    ],
+    negative_elements: [
+      'skyscrapers', 'glass buildings', 'highway overpasses', 'neon signs',
+      'wide boulevard', 'modern street lighting', 'covered walkways',
+      'snow', 'pine trees', 'European architecture'
+    ],
+    environment_desc: 'Steep Balinese mountain road climbing through dense tropical forest. Volcanic peaks visible through mist. Terraced rice paddies on the hillside. Stone walls and small roadside temples. Narrow winding road with rough asphalt surface.'
+  },
+  jakarta: {
+    bounds: { minLat: -6.40, maxLat: -6.08, minLon: 106.65, maxLon: 107.00 },
+    name: 'Jakarta',
+    positive_elements: [
+      'mix of modern high-rise towers and older low-rise buildings',
+      'wide urban roads with heavy traffic infrastructure',
+      'tropical trees along boulevard medians',
+      'overhead power lines and utility poles',
+      'TransJakarta bus lanes',
+      'Southeast Asian riders'
+    ],
+    negative_elements: [
+      'snow', 'pine trees', 'European architecture', 'clean orderly streets',
+      'covered walkways (Singapore-style)', 'rice terraces', 'mountain backdrop'
+    ],
+    environment_desc: 'Jakarta urban road with mix of modern towers and older buildings. Wide asphalt roads with tropical trees along medians. Overhead power lines visible. Dense urban atmosphere with heavy infrastructure.'
+  },
+  lombok: {
+    bounds: { minLat: -8.95, maxLat: -8.20, minLon: 115.80, maxLon: 116.75 },
+    name: 'Lombok',
+    positive_elements: [
+      'quiet rural roads with tropical vegetation',
+      'Mount Rinjani visible in background',
+      'small villages with traditional Sasak architecture',
+      'tobacco and rice fields alongside road',
+      'occasional overhead power lines',
+      'Southeast Asian riders'
+    ],
+    negative_elements: [
+      'skyscrapers', 'modern glass buildings', 'highway overpasses',
+      'subway entrances', 'neon signs', 'snow', 'European architecture'
+    ],
+    environment_desc: 'Quiet Lombok rural road winding through tropical vegetation. Mount Rinjani visible on the horizon. Small villages with traditional architecture. Tobacco and rice fields alongside the road.'
+  },
+  zurich: {
+    bounds: { minLat: 47.30, maxLat: 47.45, minLon: 8.45, maxLon: 8.65 },
+    name: 'Zurich',
+    positive_elements: [
+      'clean European streets with tram lines',
+      'historic stone buildings alongside modern architecture',
+      'Lake Zurich or Limmat River glimpses',
+      'orderly Swiss infrastructure',
+      'deciduous trees along streets',
+      'European riders'
+    ],
+    negative_elements: [
+      'tropical palm trees', 'rice terraces', 'overhead power poles (residential)',
+      'wooden shacks', 'unpaved roads', 'heavy traffic congestion',
+      'Southeast Asian architecture'
+    ],
+    environment_desc: 'Clean Zurich street with mix of historic stone buildings and modern Swiss architecture. Tram lines embedded in road. Deciduous trees lining the street. Orderly, well-maintained infrastructure. Cool temperate light.'
+  }
+};
+
+var FALLBACK_PROFILES = {
+  tropical: {
+    name: 'Tropical Region',
+    positive_elements: [
+      'tropical vegetation, palm trees, lush greenery',
+      'warm-toned road surface',
+      'mixed urban and natural landscape'
+    ],
+    negative_elements: [
+      'snow', 'bare winter trees', 'European alpine architecture'
+    ],
+    environment_desc: 'Tropical road with lush green vegetation and warm atmosphere. Mixed urban and natural elements.'
+  },
+  temperate: {
+    name: 'Temperate Region',
+    positive_elements: [
+      'deciduous trees, maintained roads',
+      'mixed residential and commercial buildings',
+      'standard road infrastructure'
+    ],
+    negative_elements: [
+      'tropical palm trees', 'rice terraces', 'volcanic landscape'
+    ],
+    environment_desc: 'Temperate road with deciduous trees and standard urban infrastructure.'
+  },
+  alpine: {
+    name: 'Alpine Region',
+    positive_elements: [
+      'mountain roads with switchbacks',
+      'conifer forests and alpine meadows',
+      'snow-capped peaks in distance',
+      'European mountain village architecture'
+    ],
+    negative_elements: [
+      'tropical palm trees', 'high-rise buildings', 'flat terrain', 'rice terraces'
+    ],
+    environment_desc: 'Alpine mountain road with conifer forests, meadows, and peaks in the distance. European mountain architecture.'
+  }
+};
+
+function getLocationProfile(lat, lon) {
+  for (var key in LOCATION_PROFILES) {
+    var p = LOCATION_PROFILES[key];
+    if (lat >= p.bounds.minLat && lat <= p.bounds.maxLat &&
+        lon >= p.bounds.minLon && lon <= p.bounds.maxLon) {
+      return p;
+    }
+  }
+  var absLat = Math.abs(lat);
+  if (absLat < 23.5) return FALLBACK_PROFILES.tropical;
+  if (absLat > 45) return FALLBACK_PROFILES.alpine;
+  return FALLBACK_PROFILES.temperate;
+}
+
+// Weather visual descriptors for prompt generation
+var WEATHER_VISUALS = {
+  sunny: {
+    desc: 'bright sunlight, sharp shadows, vibrant colors, clear blue sky',
+    road: 'dry clean road surface with sharp shadow patterns',
+    negative: ['rain', 'wet road', 'puddles', 'grey sky', 'overcast clouds']
+  },
+  rain: {
+    desc: 'rain falling, wet reflective road surface, grey overcast sky, water droplets',
+    road: 'wet glistening asphalt with puddles reflecting light, spray from tires',
+    negative: ['bright sunshine', 'sharp shadows', 'clear blue sky', 'dry dusty road']
+  },
+  golden_hour: {
+    desc: 'warm orange-golden light, long dramatic shadows, sunset tones, lens flares',
+    road: 'warm golden light reflecting off road surface, long shadows stretching ahead',
+    negative: ['harsh midday light', 'grey sky', 'rain', 'cold blue tones']
+  },
+  overcast: {
+    desc: 'soft diffused light, muted colors, even illumination, grey sky',
+    road: 'evenly lit road surface, no harsh shadows, muted tones',
+    negative: ['bright sunshine', 'sharp shadows', 'golden warm light', 'lens flares']
+  },
+  night: {
+    desc: 'dark sky, artificial street lighting, bike lights illuminating road ahead',
+    road: 'dark road lit by bike headlight cone and streetlamps, reflective lane markings',
+    negative: ['bright daylight', 'sunshine', 'blue sky', 'sunset']
+  },
+  foggy: {
+    desc: 'misty atmosphere, reduced visibility, diffused ethereal light, moisture in air',
+    road: 'road disappearing into mist ahead, moisture on road surface',
+    negative: ['clear sky', 'long-distance views', 'sharp shadows', 'bright colors']
+  },
+  hot_midday: {
+    desc: 'harsh overhead sun, heat haze shimmer on road, intense brightness',
+    road: 'sun-bleached road surface with heat haze shimmer in the distance',
+    negative: ['rain', 'grey sky', 'cool tones', 'long shadows']
+  }
+};
+
+var flickWeather = 'auto';
+
 function getThresholdParams() {
   const ss = parseFloat(document.getElementById('thSpeedSurge').value) || 50;
   const pp = parseFloat(document.getElementById('thPowerSpike').value) || 400;
@@ -3857,8 +4122,9 @@ function renderMoments(data) {
       else if (type === 'climb') detail = '+' + m.value + ' m, ' + fmtDuration(m.duration);
       html += '<li class="' + type + '" onclick="selectIndividualMoment(\\'' + type + '\\',' + globalIdx + ',this)"><span>' + detail + '</span><span style="color:var(--text-muted)">' + fmtGarminTs(m.timestamp, m.lon) + '</span>' +
         '<button class="copy-ai-btn moment-copy-btn" title="Copy AI Prompt" onclick="event.stopPropagation();toggleAiMenu(this)">\\ud83d\\udccb<div class="copy-ai-menu">' +
-        '<div onclick="event.stopPropagation();copyIndividualMoment(\\'' + type + '\\',' + globalIdx + ',\\'video\\')">\\ud83c\\udfac Video</div>' +
+        '<div onclick="event.stopPropagation();copyIndividualMoment(\\'' + type + '\\',' + globalIdx + ',\\'flick\\')">\\ud83c\\udfac Flick POV</div>' +
         '<div onclick="event.stopPropagation();copyIndividualMoment(\\'' + type + '\\',' + globalIdx + ',\\'pov\\')">\\ud83c\\udfae POV</div>' +
+        '<div onclick="event.stopPropagation();copyIndividualMoment(\\'' + type + '\\',' + globalIdx + ',\\'video\\')">\\ud83c\\udfac Video</div>' +
         '<div onclick="event.stopPropagation();copyIndividualMoment(\\'' + type + '\\',' + globalIdx + ',\\'data\\')">\\ud83d\\udcca Data</div>' +
         '</div></button></li>';
     }
@@ -4020,8 +4286,9 @@ function renderGroupMoments(data) {
     if (m.duration) html += '<span style="font-size:0.82rem;color:var(--text-muted)">' + fmtDuration(m.duration) + '</span>';
     if (m.timestamp) html += '<span style="font-size:0.75rem;color:var(--text-muted)">' + fmtGarminTs(m.timestamp, m.lon) + '</span>';
     html += '<button class="copy-ai-btn" onclick="event.stopPropagation();toggleAiMenu(this)">\\ud83d\\udccb AI Prompt<div class="copy-ai-menu">' +
-      '<div onclick="event.stopPropagation();copyAiPrompt(' + gi + ',\\'video\\')">\\ud83c\\udfac Video Prompt</div>' +
+      '<div onclick="event.stopPropagation();copyAiPrompt(' + gi + ',\\'flick\\')">\\ud83c\\udfac Flick POV Prompt</div>' +
       '<div onclick="event.stopPropagation();copyAiPrompt(' + gi + ',\\'pov\\')">\\ud83c\\udfae POV Prompt</div>' +
+      '<div onclick="event.stopPropagation();copyAiPrompt(' + gi + ',\\'video\\')">\\ud83c\\udfac Video Prompt</div>' +
       '<div onclick="event.stopPropagation();copyAiPrompt(' + gi + ',\\'data\\')">\\ud83d\\udcca Data Prompt</div></div></button>';
     html += '</div>';
     html += '<div class="group-moment-members">';
@@ -4046,8 +4313,9 @@ function renderGroupMoments(data) {
       html += '<span class="moment-badge speed_demon">' + (MOMENT_ICONS[a.type] || '\\ud83c\\udfc6') + ' ' + (MOMENT_LABELS[a.type] || a.type) + '</span>';
       html += '<span style="font-weight:600">' + a.member_count + ' riders</span>';
       html += '<button class="copy-ai-btn" onclick="event.stopPropagation();toggleAiMenu(this)">\\ud83d\\udccb AI Prompt<div class="copy-ai-menu">' +
-        '<div onclick="event.stopPropagation();copyAchievementPrompt(' + ai + ',\\'video\\')">\\ud83c\\udfac Video Prompt</div>' +
+        '<div onclick="event.stopPropagation();copyAchievementPrompt(' + ai + ',\\'flick\\')">\\ud83c\\udfac Flick POV Prompt</div>' +
         '<div onclick="event.stopPropagation();copyAchievementPrompt(' + ai + ',\\'pov\\')">\\ud83c\\udfae POV Prompt</div>' +
+        '<div onclick="event.stopPropagation();copyAchievementPrompt(' + ai + ',\\'video\\')">\\ud83c\\udfac Video Prompt</div>' +
         '<div onclick="event.stopPropagation();copyAchievementPrompt(' + ai + ',\\'data\\')">\\ud83d\\udcca Data Prompt</div></div></button>';
       html += '</div><div class="group-moment-members">';
       for (const mem of a.members) {
@@ -4106,6 +4374,7 @@ function mapsUrl(lat, lon) {
 
 function momentValStr(type, value) {
   if (type === 'speed_surge') return (value * 3.6).toFixed(1) + ' km/h';
+  if (type === 'speed_demon') return value + ' km/h';
   if (type === 'power_spike' || type === 'sprint') return value + ' W';
   if (type === 'climb') return '+' + value + ' m';
   return String(value);
@@ -4335,12 +4604,166 @@ function buildAchievementPovPrompt(a) {
   return prompt;
 }
 
+function buildFlickPovPrompt(m) {
+  var label = MOMENT_LABELS[m.type] || m.type;
+  // Extract lat/lon from members as fallback if not on top-level
+  var lat = m.lat, lon = m.lon;
+  if (lat == null && m.members) {
+    for (var mi = 0; mi < m.members.length; mi++) {
+      if (m.members[mi].lat != null) { lat = m.members[mi].lat; lon = m.members[mi].lon; break; }
+    }
+  }
+  var tod = m.timestamp ? getTimeOfDay(m.timestamp, lon) : 'daytime';
+  var riderCount = m.members ? m.members.length : 1;
+  var peak = momentValStr(m.type, m.value);
+  var road = describeRoadAhead(m.route_shape);
+  var duration = 5;
+
+  var profile = (lat != null && lon != null) ? getLocationProfile(lat, lon) : null;
+
+  var weather = null;
+  if (flickWeather !== 'auto' && WEATHER_VISUALS[flickWeather]) {
+    weather = WEATHER_VISUALS[flickWeather];
+  } else {
+    if (tod === 'night') weather = WEATHER_VISUALS.night;
+    else if (tod === 'morning' || tod === 'evening') weather = WEATHER_VISUALS.golden_hour;
+    else weather = WEATHER_VISUALS.sunny;
+  }
+
+  var prompt = 'Vertical 9:16 video, ' + duration + ' seconds, game-style 3D cycling POV, no text overlays.\\n\\n';
+
+  prompt += 'Camera: First-person rider\\'s eye view looking forward at the road during a group ' + label.toLowerCase();
+  prompt += ' on ' + (m.route_shape ? m.route_shape.description : 'a road');
+  if (profile) prompt += ' in ' + profile.name;
+  prompt += '. The road and world fill the upper 70% of the frame. In the lower portion, the handlebars and the rider\\'s gloved hands gripping the drops are clearly visible. ';
+  prompt += 'Speed ' + (m.type === 'speed_surge' ? (m.value * 3.6).toFixed(1) + ' km/h' : peak) + '. ';
+
+  if (riderCount > 1 && m.members) {
+    var sorted = m.members.slice().sort(function(a, b) { return b.value - a.value; });
+    if (sorted.length >= 2) {
+      prompt += 'A second cyclist visible ahead, gap closing as the chase intensifies.';
+    }
+  }
+  prompt += '\\n\\n';
+
+  if (profile && profile.environment_desc) {
+    prompt += 'Environment: ' + profile.environment_desc + '\\n\\n';
+  }
+
+  if (profile && profile.positive_elements && profile.positive_elements.length > 0) {
+    prompt += 'Include: ' + profile.positive_elements.join(', ') + '.\\n\\n';
+  }
+
+  if (weather) {
+    prompt += 'Weather: ' + weather.desc + '. ' + weather.road + '.\\n\\n';
+  }
+
+  prompt += 'Road ahead: ' + road + '.\\n\\n';
+
+  prompt += 'Atmosphere: Stylized 3D game aesthetic (Zwift-like). Vibrant saturated colors, clean geometry. ';
+  prompt += todAtmosphere(tod) + '. Motion blur on road surface.\\n\\n';
+
+  if (riderCount > 1 && m.members) {
+    prompt += 'Rider positions:\\n';
+    prompt += describeGroupRiders(m) + '\\n\\n';
+  }
+
+  var negatives = [];
+  if (profile && profile.negative_elements) {
+    negatives = negatives.concat(profile.negative_elements);
+  }
+  if (weather && weather.negative) {
+    negatives = negatives.concat(weather.negative);
+  }
+  negatives.push('chainring teeth', 'derailleur mechanism', 'chain links', 'gear cassette', 'brake calipers', 'handlebars at top of frame', 'inverted camera', 'upside-down perspective');
+
+  if (negatives.length > 0) {
+    prompt += 'DO NOT INCLUDE: ' + negatives.join(', ') + '.\\n\\n';
+  }
+
+  prompt += 'Key metrics (for reference):\\n';
+  prompt += '- Event: ' + label + '\\n';
+  prompt += '- Peak: ' + peak + '\\n';
+  if (m.timestamp) prompt += '- Time: ' + fmtGarminTs(m.timestamp, lon) + '\\n';
+  if (m.duration) prompt += '- Duration: ' + m.duration + 's\\n';
+  if (lat != null && lon != null) {
+    prompt += '- GPS: ' + lat.toFixed(4) + ', ' + lon.toFixed(4) + '\\n';
+    prompt += '- Street View: ' + streetViewUrl(lat, lon) + '\\n';
+  }
+
+  return prompt;
+}
+
+function buildFlickIndividualPovPrompt(m, type) {
+  var label = MOMENT_LABELS[type] || type;
+  var tod = m.timestamp ? getTimeOfDay(m.timestamp, m.lon) : 'daytime';
+  var val = momentValStr(type, m.value);
+  var fname = currentMomentsFileId && files[currentMomentsFileId] ? files[currentMomentsFileId].filename.replace(/\\.fit$/i, '') : 'Cyclist';
+  var road = describeRoadAhead(m.route_shape);
+  var duration = 5;
+
+  var profile = (m.lat != null && m.lon != null) ? getLocationProfile(m.lat, m.lon) : null;
+
+  var weather = null;
+  if (flickWeather !== 'auto' && WEATHER_VISUALS[flickWeather]) {
+    weather = WEATHER_VISUALS[flickWeather];
+  } else {
+    if (tod === 'night') weather = WEATHER_VISUALS.night;
+    else if (tod === 'morning' || tod === 'evening') weather = WEATHER_VISUALS.golden_hour;
+    else weather = WEATHER_VISUALS.sunny;
+  }
+
+  var prompt = 'Vertical 9:16 video, ' + duration + ' seconds, game-style 3D cycling POV, no text overlays.\\n\\n';
+  prompt += 'Camera: First-person rider\\'s eye view looking forward at the road during a ' + label.toLowerCase() + '. ';
+  prompt += 'The road and world fill the upper 70% of the frame. In the lower portion, the handlebars and the rider\\'s gloved hands gripping the drops are clearly visible. ';
+  prompt += 'Rider: ' + fname + ' at ' + val + '. ';
+  if (m.route_shape) prompt += 'Road: ' + m.route_shape.description + '. ';
+  if (profile) prompt += 'Location: ' + profile.name + '. ';
+  prompt += '\\n\\n';
+
+  if (profile && profile.environment_desc) {
+    prompt += 'Environment: ' + profile.environment_desc + '\\n\\n';
+  }
+
+  if (weather) {
+    prompt += 'Weather: ' + weather.desc + '. ' + weather.road + '.\\n\\n';
+  }
+
+  prompt += 'Road ahead: ' + road + '.\\n\\n';
+
+  prompt += 'Atmosphere: Stylized 3D game aesthetic (Zwift-like). Vibrant saturated colors, clean geometry. ';
+  prompt += todAtmosphere(tod) + '.\\n\\n';
+
+  if (type === 'climb') {
+    prompt += 'Camera: Road tilting upward visibly, terrain rising, gradient ' + (m.route_shape ? m.route_shape.gradient_pct + '%' : 'visible') + '. Rider effort visible in hand grip.\\n\\n';
+  } else if (type === 'sprint') {
+    prompt += 'Camera: Road surface streaking with speed, lane markings blurring past, aggressive rider position.\\n\\n';
+  } else if (type === 'speed_surge') {
+    prompt += 'Camera: Extreme speed effect, background streaking, tunnel vision focus on road ahead.\\n\\n';
+  }
+
+  var negatives = [];
+  if (profile && profile.negative_elements) negatives = negatives.concat(profile.negative_elements);
+  if (weather && weather.negative) negatives = negatives.concat(weather.negative);
+  negatives.push('chainring teeth', 'derailleur mechanism', 'chain links', 'gear cassette', 'brake calipers', 'handlebars at top of frame', 'inverted camera', 'upside-down perspective');
+
+  if (negatives.length > 0) {
+    prompt += 'DO NOT INCLUDE: ' + negatives.join(', ') + '.\\n';
+  }
+
+  return prompt;
+}
+
 function copyAiPrompt(idx, variant) {
   document.querySelectorAll('.copy-ai-menu.show').forEach(m => m.classList.remove('show'));
   const gm = window._groupMoments || [];
   if (idx < 0 || idx >= gm.length) return;
   const m = gm[idx];
-  const text = variant === 'pov' ? buildPovPrompt(m) : variant === 'data' ? buildDataPrompt(m) : buildVideoPrompt(m);
+  let text;
+  if (variant === 'flick') text = buildFlickPovPrompt(m);
+  else if (variant === 'pov') text = buildPovPrompt(m);
+  else if (variant === 'data') text = buildDataPrompt(m);
+  else text = buildVideoPrompt(m);
   copyToClipboard(text);
 }
 
@@ -4423,12 +4846,100 @@ function buildAchievementDataPrompt(a) {
   return prompt;
 }
 
+function buildFlickAchievementPovPrompt(a) {
+  var label = MOMENT_LABELS[a.type] || a.type;
+  var riderCount = a.members ? a.members.length : 1;
+  var duration = 5;
+
+  // Extract lat/lon and timestamp from members (achievements don't have top-level lat/lon)
+  var lat = null, lon = null, earliestTs = null;
+  var riderLines = [];
+  if (a.members) {
+    for (var mi = 0; mi < a.members.length; mi++) {
+      var mem = a.members[mi];
+      if (mem.lat != null && lat === null) { lat = mem.lat; lon = mem.lon; }
+      if (mem.timestamp && (earliestTs === null || mem.timestamp < earliestTs)) earliestTs = mem.timestamp;
+      var fname = files[mem.file_id] ? files[mem.file_id].filename.replace(/\\.fit$/i, '') : mem.file_id;
+      riderLines.push(fname + ' at ' + mem.value + ' km/h');
+    }
+  }
+
+  var tod = earliestTs ? getTimeOfDay(earliestTs, lon) : 'daytime';
+  var profile = (lat != null && lon != null) ? getLocationProfile(lat, lon) : null;
+
+  var weather = null;
+  if (flickWeather !== 'auto' && WEATHER_VISUALS[flickWeather]) {
+    weather = WEATHER_VISUALS[flickWeather];
+  } else {
+    if (tod === 'night') weather = WEATHER_VISUALS.night;
+    else if (tod === 'morning' || tod === 'evening') weather = WEATHER_VISUALS.golden_hour;
+    else weather = WEATHER_VISUALS.sunny;
+  }
+
+  var prompt = 'Vertical 9:16 video, ' + duration + ' seconds, game-style 3D cycling POV, no text overlays.\\n\\n';
+
+  prompt += 'Camera: First-person rider\\'s eye view looking forward at the road during a ' + label.toLowerCase() + ' achievement at extreme speed';
+  if (profile) prompt += ' in ' + profile.name;
+  prompt += '. The road and world fill the upper 70% of the frame. In the lower portion, the handlebars and the rider\\'s gloved hands gripping the drops are clearly visible. ';
+  prompt += 'Speed ' + (a.max_value || a.value) + ' km/h. ';
+
+  if (riderCount > 1) {
+    prompt += (riderCount - 1) + ' other cyclist' + (riderCount > 2 ? 's' : '') + ' visible on the road, being overtaken at extreme speed.';
+  }
+  prompt += '\\n\\n';
+
+  if (profile && profile.environment_desc) {
+    prompt += 'Environment: ' + profile.environment_desc + '\\n\\n';
+  }
+
+  if (profile && profile.positive_elements && profile.positive_elements.length > 0) {
+    prompt += 'Include: ' + profile.positive_elements.join(', ') + '.\\n\\n';
+  }
+
+  if (weather) {
+    prompt += 'Weather: ' + weather.desc + '. ' + weather.road + '.\\n\\n';
+  }
+
+  prompt += 'Road ahead: smooth open road stretching ahead, bold lane markings blurring with extreme speed.\\n\\n';
+
+  prompt += 'Atmosphere: Stylized 3D game aesthetic (Zwift-like). Vibrant saturated colors, clean geometry. ';
+  prompt += todAtmosphere(tod) + '. Extreme motion blur on road surface.\\n\\n';
+
+  if (riderLines.length > 0) {
+    prompt += 'Riders: ' + riderLines.join(', ') + '.\\n\\n';
+  }
+
+  var negatives = [];
+  if (profile && profile.negative_elements) negatives = negatives.concat(profile.negative_elements);
+  if (weather && weather.negative) negatives = negatives.concat(weather.negative);
+  negatives.push('chainring teeth', 'derailleur mechanism', 'chain links', 'gear cassette', 'brake calipers', 'handlebars at top of frame', 'inverted camera', 'upside-down perspective');
+
+  if (negatives.length > 0) {
+    prompt += 'DO NOT INCLUDE: ' + negatives.join(', ') + '.\\n\\n';
+  }
+
+  prompt += 'Key metrics (for reference):\\n';
+  prompt += '- Achievement: ' + label + '\\n';
+  prompt += '- Max Speed: ' + (a.max_value || a.value) + ' km/h\\n';
+  if (earliestTs) prompt += '- Time: ' + fmtGarminTs(earliestTs, lon) + '\\n';
+  if (lat != null && lon != null) {
+    prompt += '- GPS: ' + lat.toFixed(4) + ', ' + lon.toFixed(4) + '\\n';
+    prompt += '- Street View: ' + streetViewUrl(lat, lon) + '\\n';
+  }
+
+  return prompt;
+}
+
 function copyAchievementPrompt(idx, variant) {
   document.querySelectorAll('.copy-ai-menu.show').forEach(m => m.classList.remove('show'));
   const ga = window._groupAchievements || [];
   if (idx < 0 || idx >= ga.length) return;
   const a = ga[idx];
-  const text = variant === 'pov' ? buildAchievementPovPrompt(a) : variant === 'data' ? buildAchievementDataPrompt(a) : buildAchievementVideoPrompt(a);
+  let text;
+  if (variant === 'flick') text = buildFlickAchievementPovPrompt(a);
+  else if (variant === 'pov') text = buildAchievementPovPrompt(a);
+  else if (variant === 'data') text = buildAchievementDataPrompt(a);
+  else text = buildAchievementVideoPrompt(a);
   copyToClipboard(text);
 }
 
@@ -4487,7 +4998,11 @@ function copyIndividualMoment(type, idx, variant) {
   const moments = (window._individualMoments || {})[type] || [];
   if (idx < 0 || idx >= moments.length) return;
   const m = moments[idx];
-  const text = variant === 'pov' ? buildIndividualPovPrompt(m, type) : variant === 'data' ? buildIndividualPrompt(m, type) : buildIndividualPrompt(m, type);
+  let text;
+  if (variant === 'flick') text = buildFlickIndividualPovPrompt(m, type);
+  else if (variant === 'pov') text = buildIndividualPovPrompt(m, type);
+  else if (variant === 'data') text = buildIndividualPrompt(m, type);
+  else text = buildIndividualPrompt(m, type);
   copyToClipboard(text);
 }
 
